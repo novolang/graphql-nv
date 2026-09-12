@@ -1,0 +1,292 @@
+// gqlerr.nv — the error shape the specification puts on the wire, and
+// the faults that never reach it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// GRAPHQL HAS TWO ERROR VOCABULARIES AND THEY ARE NOT INTERCHANGEABLE.
+//
+// `GqlError` is the one in the RESPONSE: § 7.1.2's `errors` entry,
+// with a `message`, a `locations` list, a `path`, and an `extensions`
+// object.  It travels to the client and it is what a client library
+// hands an application.  A response may carry BOTH `data` and `errors`
+// — a query whose third field's resolver failed answers the other two
+// fields and one error — and that partial shape is the whole reason
+// the list exists rather than a `Result`.
+//
+// `GqlFault` is the one that never leaves the server: a document that
+// did not parse, a schema that contradicts itself, a request whose
+// body was not JSON.  These end an exchange rather than annotating
+// one, and the transport answers a status for them.
+//
+// THE STATUS CODE IS THE PART EVERYBODY GETS WRONG.  A GraphQL
+// response carrying errors is a **200** — the query executed, some
+// fields failed, and the body says which.  A 500 is for a request that
+// never became an execution.  A client library that retried on 500
+// would, against a server that answered 500 for a failed resolver,
+// retry every partial success forever.  GraphQL over HTTP makes one
+// exception, and it is narrow: a request that failed to parse or
+// validate MAY be a 400 when the response media type is
+// `application/graphql-response+json`.  `gqlhttp.status_for` is where
+// that whole table lives.
+//
+// EVERY ERROR NAMES A PATH.  `path` is the response path to the field
+// that failed — `["user", "posts", 2, "title"]` — and it is what turns
+// "something went wrong" into a thing an application can act on: the
+// client knows which of the forty fields it asked for is the null.  A
+// library that omitted it produces errors nobody can use.
+
+// One entry in a response's `errors` list (§ 7.1.2).
+pub struct GqlError
+    // The message, meant for a developer.  A production server that
+    // puts an exception's text here has published its stack shape; a
+    // server that puts "internal error" here has published nothing
+    // anybody can act on.  `extensions` is where the middle ground
+    // goes — a code a client can branch on.
+    message: Str
+    // Where in the QUERY DOCUMENT the error is, for a parse or
+    // validation failure.  Empty for a resolver's error, which did not
+    // happen at a place in the document.
+    locations: [GqlLoc]
+    // The path through the RESPONSE to the field that failed.
+    // Segments are field names and list indices, so
+    // `user.posts.2.title` is four of them.  Empty for an error that
+    // is not about a field.
+    path: [Str]
+    // Anything else, as a JSON object's text.  The specification
+    // reserves this for implementations and it is where a stable
+    // machine-readable `code` belongs — because `message` is prose and
+    // a client that matched on prose breaks when the prose improves.
+    extensions: Str
+
+// A line and column in a query document.
+pub struct GqlLoc
+    // One-based, as § 7.1.2 requires.  A parser that reports
+    // zero-based lines reports them into an editor that highlights the
+    // wrong one.
+    line: Int
+    // One-based, and counted in CHARACTERS rather than bytes: the
+    // document is Unicode, and a column measured in bytes points to
+    // the middle of a name as soon as somebody uses one.
+    column: Int
+
+// The things that end an exchange rather than annotating one.
+pub enum GqlFault
+    // The query document did not parse.  § 5.1.1 makes this a request
+    // error: nothing executes.
+    GqlSyntaxError(message: Str, line: Int, column: Int)
+    // The document parsed and failed validation.  The list is every
+    // rule it broke, because a document with six problems should
+    // report six — a developer fixing them one round trip at a time is
+    // six round trips.
+    GqlValidationFailed(errors: [GqlError])
+    // The SDL did not parse, or described a schema that cannot exist:
+    // a type that implements an interface it does not satisfy, a field
+    // whose type is not defined, two types with one name.
+    GqlSchemaInvalid(message: Str)
+    // The request body was not the shape GraphQL over HTTP describes:
+    // not JSON, no `query` member, `variables` that is not an object.
+    GqlRequestMalformed(message: Str)
+    // The named operation is not in the document, or the document has
+    // several and the request named none.  § 6.1's two refusals, which
+    // are one variant because they have one fix.
+    GqlOperationNotFound(name: Str)
+    // A variable's value does not match its declared type, checked
+    // before execution (§ 6.1.2).  Every bad variable, not the first.
+    GqlVariablesInvalid(errors: [GqlError])
+    // The document exceeded a bound the deployment set: depth,
+    // breadth, aliases, or complexity.  A query language that lets a
+    // client ask for a hundred nested lists is a denial of service
+    // with a schema attached, and `GqlLimits` is where the numbers
+    // live.
+    GqlTooLarge(measure: Str, value: Int, ceiling: Int)
+    // Something this package does not implement, named.  A
+    // subscription operation is the one that exists today.
+    GqlUnsupported(feature: Str)
+
+// The standard `Error` implementation, so a refused request is
+// reported by anything that reports errors.
+impl Error for GqlFault
+    // One line: what stage refused, and what it refused.
+    fn message(self) -> Str
+        todo("graphql-nv.gqlerr.GqlFault.message")
+
+// An error with only a message.
+//
+// What a resolver answers when it has nothing more to say.  The
+// executor fills in the `path` — a resolver does not know where in the
+// response it is, and should not have to.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.error("the account is suspended").message)
+// ```
+pub fn error(message: Str) -> GqlError []
+    todo("graphql-nv.gqlerr.error")
+
+// An error with a machine-readable code in its `extensions`.
+//
+// The shape a client can branch on.  `message` is prose and improves;
+// a client that matched on prose breaks when it does.  Apollo's
+// convention is `extensions.code`, and following it is free.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.error_with_code("not signed in", "UNAUTHENTICATED").extensions)
+// ```
+pub fn error_with_code(message: Str, code: Str) -> GqlError []
+    todo("graphql-nv.gqlerr.error_with_code")
+
+// The same error at a place in the query document.
+//
+// For a parse or validation failure, which did happen at a place.
+//
+// ```novo
+// use std.list
+// use gqlerr
+//
+// fn main() [io]
+//     let e = gqlerr.at(gqlerr.error("unknown field"), 3, 5)
+//     println("${list.len(e.locations)}")
+// ```
+pub fn at(e: GqlError, line: Int, column: Int) -> GqlError []
+    todo("graphql-nv.gqlerr.at")
+
+// The same error at a path through the response.
+//
+// The executor calls this; a resolver does not have to.
+//
+// ```novo
+// use std.list
+// use gqlerr
+//
+// fn main() [io]
+//     let e = gqlerr.at_path(gqlerr.error("no"), ["user", "posts", "2", "title"])
+//     println("${list.len(e.path)}")
+// ```
+pub fn at_path(e: GqlError, path: [Str]) -> GqlError []
+    todo("graphql-nv.gqlerr.at_path")
+
+// The `extensions` object of an error, replaced.
+//
+// Takes the JSON text so a caller can put whatever its deployment
+// wants there without this package modelling it.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.with_extensions(gqlerr.error("no"), "{\"retryable\":true}").extensions)
+// ```
+pub fn with_extensions(e: GqlError, extensions_json: Str) -> GqlError []
+    todo("graphql-nv.gqlerr.with_extensions")
+
+// The `code` in an error's extensions, or empty.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.code_of(gqlerr.error_with_code("no", "FORBIDDEN")))
+// ```
+pub fn code_of(e: GqlError) -> Str []
+    todo("graphql-nv.gqlerr.code_of")
+
+// An error's path, printed the way a person reads one:
+// `user.posts.2.title`.
+//
+// For a log.  The wire form is a JSON array and stays one.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.path_text(gqlerr.at_path(gqlerr.error("no"), ["user", "name"])))
+// ```
+pub fn path_text(e: GqlError) -> Str []
+    todo("graphql-nv.gqlerr.path_text")
+
+// An error as the JSON object § 7.1.2 specifies.
+//
+// Published because the shape is exact — `message`, `locations`,
+// `path`, `extensions`, and no other members at the top level — and a
+// caller assembling it by hand assembles it slightly differently, at
+// which point a client library stops recognising it.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println(gqlerr.error_json(gqlerr.error("no")))
+// ```
+pub fn error_json(e: GqlError) -> Str []
+    todo("graphql-nv.gqlerr.error_json")
+
+// A fault as the list of errors a response would carry.
+//
+// The bridge between the two vocabularies: a syntax error becomes one
+// error with a location, a validation failure becomes the list it
+// already holds, a variable failure the same.  The transport calls
+// this.
+//
+// ```novo
+// use std.list
+// use gqlerr
+//
+// fn main() [io]
+//     let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
+//     println("${list.len(gqlerr.errors_of(f))}")
+// ```
+pub fn errors_of(f: GqlFault) -> [GqlError] []
+    todo("graphql-nv.gqlerr.errors_of")
+
+// Whether a fault happened BEFORE execution began.
+//
+// § 7.1's distinction, and the one the transport needs: a request
+// error means the response carries NO `data` member at all — not
+// `"data": null`, which means "execution started and the root field
+// failed".  A client can tell the two apart and a server that
+// conflates them tells it something false.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println("${gqlerr.is_request_error(gqlerr.GqlSyntaxError("no", 1, 1))}")
+// ```
+pub fn is_request_error(f: GqlFault) -> Bool []
+    todo("graphql-nv.gqlerr.is_request_error")
+
+// Whether a fault is the schema's rather than the request's.
+//
+// True for `GqlSchemaInvalid` alone: every request against that
+// deployment fails identically until somebody fixes the schema, which
+// is a different alert from a client sending a bad query.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println("${gqlerr.is_configuration_fault(gqlerr.GqlSchemaInvalid("no such type"))}")
+// ```
+pub fn is_configuration_fault(f: GqlFault) -> Bool []
+    todo("graphql-nv.gqlerr.is_configuration_fault")
+
+// Whether a fault's message may be shown to a client.
+//
+// True for the syntax, validation, variable and limit failures, all of
+// which are about the CLIENT'S OWN document and telling it so is the
+// point.  False for `GqlSchemaInvalid`, whose message describes the
+// server's configuration.
+//
+// ```novo
+// use gqlerr
+//
+// fn main() [io]
+//     println("${gqlerr.is_client_safe(gqlerr.GqlSchemaInvalid("no"))}")
+// ```
+pub fn is_client_safe(f: GqlFault) -> Bool []
+    todo("graphql-nv.gqlerr.is_client_safe")

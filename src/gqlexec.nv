@@ -1,0 +1,490 @@
+// gqlexec.nv — § 6's execution, over one trait with an effect
+// parameter.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `GqlResolver[e]` IS THE LOAD-BEARING INTERFACE OF THIS PACKAGE, and
+// the shape it is NOT is the argument.
+//
+// The obvious API is a TABLE: a map from `(type, field)` to a named
+// function, registered at start-up, which is what a reader coming from
+// async-graphql or graphql-js expects.  It cannot be effect-polymorphic
+// here, and the reason is precise rather than a limitation to grumble
+// about.  SPEC § 5.6 charges a generic function what its bounded
+// argument's impl supplies — but a bounded value reached through a
+// CONTAINER falls back to the union over every impl, which is
+// documented and deliberate.  A table of resolvers is exactly that
+// container.  So a table has to name ONE fixed effect row, and the only
+// row that admits every resolver anybody might write is the whole host
+// budget.  Every GraphQL server in the language would then declare
+// `[io, fs, net, time, mutate]`, whether its resolvers read a database
+// or answered from a constant — which makes the row a ceiling instead
+// of a description, and a ceiling tells a reviewer nothing.
+//
+// One trait, implemented once, does not have that problem:
+//
+//     pub fn execute<R: GqlResolver[e]>(…) -> GqlResponse [e]
+//
+// A deployment whose resolvers hit a database implements
+// `GqlResolver[net]` and its server declares `[net]`.  One whose
+// resolvers answer from a value in memory implements `GqlResolver[]`
+// and its server declares nothing — which is a real shape: a schema
+// served from a build-time snapshot, and a test.
+//
+// AND IT IS THE FAITHFUL PORT.  async-graphql's `#[Object]` macro
+// GENERATES a dispatch over field names on one impl; strawberry's
+// decorator does the same over one class.  What a caller writes here
+// is that dispatch by hand — a `match` on `(ctx.type_name,
+// ctx.field_name)` — which is the code those macros produce, written
+// where a reader can see it.  There is no macro to write it because
+// `@derive` is reserved and refused in this language, and the README
+// says so rather than leaving a reader to wonder.
+//
+// A RESOLVER'S FAILURE IS NOT THE QUERY'S FAILURE.  `GqlOutcome` has a
+// value variant and an error variant, and an error is collected into
+// the response's `errors` list with the field's PATH filled in by the
+// executor — the resolver does not know where in the response it is,
+// and should not have to.  § 6.4.4's null propagation then decides how
+// far up the null goes: to the field if it is nullable, to the parent
+// if it is not, and to `"data": null` if the chain reaches the root.
+// That rule is the one implementations get wrong, and it is one
+// function here.
+//
+// SUBSCRIPTIONS ARE A NAMED GAP.  `gqllang` PARSES a subscription and
+// `gqlsdl` accepts a subscription root type; `execute` refuses one
+// with `GqlUnsupported("subscription")`.  The missing half is not the
+// event stream — § 6.2.3's `CreateSourceEventStream` is a resolver
+// that answers many values instead of one — it is the TRANSPORT: the
+// graphql-ws sub-protocol over a WebSocket, which is websocket-nv's
+// surface plus a message protocol of its own.  When it is written it
+// is `gqlexec.subscribe` beside `execute`, with a `GqlResolver[e]`
+// that answers a stream, and nothing in this module's surface changes.
+
+use gqlerr
+use gqllang
+use gqlsdl
+
+// What a resolver was asked for.
+//
+// Everything § 6.4's `ResolveFieldValue` receives, as one value: the
+// parent object's type and the parent value, the field, the coerced
+// arguments, the path, and the caller's own context.
+pub struct GqlFieldCtx
+    // The CONCRETE type the parent value is — never an interface or a
+    // union name.  § 6.4.1 resolves the abstract type before the field
+    // is resolved, so a resolver dispatching on this never has to.
+    type_name: Str
+    // The field's name in the SCHEMA, never its alias.  A resolver
+    // that matched on the alias would be matched on a name the client
+    // chose.
+    field_name: Str
+    // The RESPONSE KEY — the alias where there is one.  Carried so a
+    // resolver can log what the client called it, and never for
+    // dispatch.
+    response_key: Str
+    // The parent value, as the JSON the parent's resolver answered.
+    // The root field's parent is the root value the caller passed to
+    // `execute`.
+    parent_json: Str
+    // The arguments, coerced against the schema (§ 6.4.1), as a JSON
+    // object.  Coerced, which means defaults are applied, variables
+    // are substituted and every value already fits its declared type —
+    // so a resolver reads them rather than checking them.
+    args_json: Str
+    // The path to this field in the response, for a log and for an
+    // error a resolver wants to raise itself.
+    path: [Str]
+    // The caller's own per-request context, as whatever text it likes:
+    // the signed-in person's identifier, a request identifier, a
+    // trace parent.  A string rather than a type parameter because a
+    // second parameter on the trait would collide with the effect one,
+    // and because everything anybody puts here serialises.
+    context: Str
+
+// What a resolver answered.
+pub enum GqlOutcome
+    // A value, as JSON.  For a composite field this is the object the
+    // CHILD resolvers will be called against — so a resolver for
+    // `user` answers the user, and the resolvers for `user.name` and
+    // `user.email` are called with it as their parent.
+    GqlValue(json: Str)
+    // A failure.  Collected into the response's `errors` with the
+    // path filled in, and then § 6.4.4 decides how far the null
+    // propagates.
+    GqlFailed(error: gqlerr.GqlError)
+    // This field is not one this resolver knows.  DISTINCT from a
+    // failure, because it means the schema and the resolver disagree —
+    // a deployment fault that should be loud at start-up rather than a
+    // null a client sees at run time.  `check_coverage` is how a
+    // deployment finds them before a client does.
+    GqlNoResolver
+
+// Where sensible fields on a resolver come from.
+//
+// The effect parameter is the point: a deployment's resolvers declare
+// what they cost at the `impl`, and `execute` is charged that rather
+// than a union over every resolver anybody might write.
+pub trait GqlResolver[e]
+    // One field.
+    //
+    // Called once per field per parent object, so a list of a hundred
+    // users with three fields each is three hundred calls — which is
+    // the N+1 problem, and `gqlexec` does not solve it: batching is a
+    // resolver's own business and every solution to it is a cache with
+    // a lifetime, which a library cannot choose.  `GqlFieldCtx.context`
+    // is where a caller's batch loader lives.
+    fn gql_resolve(self, ctx: GqlFieldCtx) -> GqlOutcome [e]
+
+    // The CONCRETE type of a value whose static type is an interface
+    // or a union (§ 6.4.1).
+    //
+    // A separate method because the executor cannot answer it: only
+    // the deployment knows that this particular JSON object is a `Dog`
+    // rather than a `Cat`.  Answering an empty string is a field error
+    // naming the abstract type, which is the honest failure — a guess
+    // would run the wrong fields.
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str [e]
+
+    // A custom scalar's OUTPUT coercion (§ 3.5.7).
+    //
+    // The one place a deployment says what its `Date` and its `URL`
+    // are.  Answering the value unchanged is the default and is what a
+    // deployment with no custom scalars writes.
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> GqlOutcome [e]
+
+// A response, as § 7.1 shapes one.
+pub struct GqlResponse
+    // The `data` member, as JSON.  Empty text where there is NO data
+    // member at all — a request error — and the literal `null` where
+    // execution began and the root field failed.  The two are
+    // different things and a client can tell them apart, so a server
+    // that conflated them tells it something false.
+    data: Str
+    // The errors, in the order they were collected.
+    errors: [gqlerr.GqlError]
+    // The `extensions` member, as JSON, empty where there is none.
+    // A deployment's timing and tracing go here.
+    extensions: Str
+
+// What a request asked to execute.
+pub struct GqlRequest
+    // The document.
+    query: Str
+    // The operation to run, empty where the document has one.
+    operation_name: Str
+    // The variables, as a JSON object; empty text for none.
+    variables: Str
+    // The `extensions` member, as JSON.  Where a persisted-query
+    // identifier arrives.
+    extensions: Str
+
+// ── Executing ────────────────────────────────────────────────────────
+
+// A whole request: parse, validate, coerce, execute.
+//
+// `[e]` — this costs exactly what the caller's resolver costs.  A
+// deployment whose resolvers read a database declares `[net]`; one
+// whose resolvers answer from memory declares nothing.
+//
+// Answers a `GqlResponse` rather than a `Result` for anything that
+// happened during EXECUTION, because a partial success is the ordinary
+// case: a query whose third field failed answers the other two and one
+// error.  A request that never became an execution — a syntax error, a
+// validation failure, a bad variable — is the `Result`'s error, and
+// `gqlerr.is_request_error` is the predicate that tells them apart.
+//
+// Refuses a subscription with `GqlUnsupported("subscription")`.
+//
+// ```novo
+// use gqlexec
+// use gqllang
+// use gqlsdl
+//
+// // A resolver that answers everything from a constant, so the
+// // example costs nothing at all.
+// struct DocResolver
+//     root: Str
+//
+// impl GqlResolver[] for DocResolver
+//     fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+//         GqlValue("null")
+//     fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+//         ""
+//     fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+//         GqlValue(value_json)
+//
+// fn a_resolver() -> DocResolver
+//     DocResolver { root: "{}" }
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no schema")
+//         Ok(s)  =>
+//             let req = gqlexec.request("{ me }")
+//             match gqlexec.execute(s, a_resolver(), req, "{}", gqllang.default_limits())
+//                 Ok(r)  => println(r.data)
+//                 Err(_) => println("that request never became an execution")
+// ```
+pub fn execute<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, req: GqlRequest, root_json: Str,
+                                  lim: gqllang.GqlLimits) -> Result<GqlResponse, gqlerr.GqlFault> [e]
+    todo("graphql-nv.gqlexec.execute")
+
+// The same, on a document already parsed and validated.
+//
+// For a persisted-query deployment, which parses and validates once at
+// deploy time and executes thousands of times — and for which
+// re-parsing per request is the whole cost of the layer.
+//
+// ```novo
+// use gqlexec
+// use gqllang
+// use gqlsdl
+//
+// // A resolver that answers everything from a constant, so the
+// // example costs nothing at all.
+// struct DocResolver
+//     root: Str
+//
+// impl GqlResolver[] for DocResolver
+//     fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+//         GqlValue("null")
+//     fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+//         ""
+//     fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+//         GqlValue(value_json)
+//
+// fn a_resolver() -> DocResolver
+//     DocResolver { root: "{}" }
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  =>
+//                     match gqlexec.execute_document(s, a_resolver(), d, "", "{}", "{}")
+//                         Ok(r)  => println(r.data)
+//                         Err(_) => println("no such operation")
+// ```
+pub fn execute_document<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang.GqlDocument,
+                                           operation_name: Str, variables_json: Str,
+                                           root_json: Str) -> Result<GqlResponse, gqlerr.GqlFault> [e]
+    todo("graphql-nv.gqlexec.execute_document")
+
+// A request with only a document.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println(gqlexec.request("{ me }").query)
+// ```
+pub fn request(query: Str) -> GqlRequest []
+    todo("graphql-nv.gqlexec.request")
+
+// The same request with variables.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println(gqlexec.with_variables(gqlexec.request("{ me }"), "{\"id\":1}").variables)
+// ```
+pub fn with_variables(req: GqlRequest, variables_json: Str) -> GqlRequest []
+    todo("graphql-nv.gqlexec.with_variables")
+
+// The same request naming an operation.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println(gqlexec.with_operation(gqlexec.request("{ me }"), "Me").operation_name)
+// ```
+pub fn with_operation(req: GqlRequest, name: Str) -> GqlRequest []
+    todo("graphql-nv.gqlexec.with_operation")
+
+// ── The response ─────────────────────────────────────────────────────
+
+// A response as the JSON § 7.1 specifies.
+//
+// The member ORDER is `errors`, `data`, `extensions` — which is
+// § 7.1's own recommendation, and it is not cosmetic: a client
+// streaming a large response sees the errors before it has parsed
+// megabytes of data it may not need.
+//
+// A response with NO data member omits it entirely rather than
+// emitting `"data": null`.  The two mean different things and a client
+// library branches on which it got.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println(gqlexec.response_json(gqlexec.empty_response()))
+// ```
+pub fn response_json(r: GqlResponse) -> Str []
+    todo("graphql-nv.gqlexec.response_json")
+
+// A response carrying nothing: no data, no errors.
+//
+// A starting point for a caller assembling one, and the shape a
+// `HEAD`-like probe answers.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println("${gqlexec.has_data(gqlexec.empty_response())}")
+// ```
+pub fn empty_response() -> GqlResponse []
+    todo("graphql-nv.gqlexec.empty_response")
+
+// A response carrying only errors, for a request that never executed.
+//
+// ```novo
+// use gqlerr
+// use gqlexec
+//
+// fn main() [io]
+//     let r = gqlexec.error_response([gqlerr.error("bad request")])
+//     println("${gqlexec.has_data(r)}")
+// ```
+pub fn error_response(errors: [gqlerr.GqlError]) -> GqlResponse []
+    todo("graphql-nv.gqlexec.error_response")
+
+// Whether a response carries a `data` member at all.
+//
+// § 7.1's distinction, and the one a client branches on: no `data`
+// means the request never executed; `"data": null` means it did and
+// the root field failed.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println("${gqlexec.has_data(gqlexec.empty_response())}")
+// ```
+pub fn has_data(r: GqlResponse) -> Bool []
+    todo("graphql-nv.gqlexec.has_data")
+
+// A response with `extensions` set, for timing or tracing.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     let r = gqlexec.with_extensions(gqlexec.empty_response(), "{\"ms\":12}")
+//     println(r.extensions)
+// ```
+pub fn with_extensions(r: GqlResponse, extensions_json: Str) -> GqlResponse []
+    todo("graphql-nv.gqlexec.with_extensions")
+
+// ── Null propagation ─────────────────────────────────────────────────
+
+// How far a field error's null propagates (§ 6.4.4).
+//
+// The rule implementations get wrong, as one function: a failed field
+// whose type is nullable becomes null and stops there; a failed field
+// whose type is NON-NULL makes its PARENT null, and if the parent is
+// also non-null that continues upward, and if the chain reaches the
+// root the whole `data` member is null.
+//
+// Answers the response path the null lands at — empty for the root,
+// which is the `"data": null` case.  Published because a deployment
+// reading "why did my whole response go null" needs to see the chain,
+// and because the executor and any caller assembling a response by
+// hand have to agree.
+//
+// ```novo
+// use std.list
+// use gqlexec
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${list.len(gqlexec.null_lands_at(s, "Query", ["me"]))}")
+// ```
+pub fn null_lands_at(s: gqlsdl.GqlSchema, root_type: Str, path: [Str]) -> [Str] []
+    todo("graphql-nv.gqlexec.null_lands_at")
+
+// Whether a mutation's top-level fields run in SERIAL (§ 6.3.1).
+//
+// True for a mutation and false for a query, and it is not an
+// optimisation detail: a mutation's fields are ordered because the
+// second may depend on the first, and a server that ran them
+// concurrently would produce a different answer depending on
+// scheduling.  A query's are NOT ordered, and a client that assumed
+// they were got it by accident.
+//
+// ```novo
+// use gqlexec
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqlexec.runs_serially(gqllang.GqlMutation)}")
+// ```
+pub fn runs_serially(kind: gqllang.GqlOpKind) -> Bool []
+    todo("graphql-nv.gqlexec.runs_serially")
+
+// ── Coverage ─────────────────────────────────────────────────────────
+
+// Every field in a schema a resolver answers `GqlNoResolver` for.
+//
+// The check to run at START-UP, once, so a schema and a resolver that
+// disagree are a loud failure at boot rather than a null a client sees
+// at three in the morning.  `[e]` because asking costs whatever the
+// resolver costs — and a resolver that reads a database to answer a
+// coverage probe is a resolver worth rewriting.
+//
+// ```novo
+// use std.list
+// use gqlexec
+// use gqllang
+// use gqlsdl
+//
+// // A resolver that answers everything from a constant, so the
+// // example costs nothing at all.
+// struct DocResolver
+//     root: Str
+//
+// impl GqlResolver[] for DocResolver
+//     fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+//         GqlValue("null")
+//     fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+//         ""
+//     fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+//         GqlValue(value_json)
+//
+// fn a_resolver() -> DocResolver
+//     DocResolver { root: "{}" }
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${list.len(gqlexec.check_coverage(s, a_resolver()))}")
+// ```
+pub fn check_coverage<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R) -> [Str] [e]
+    todo("graphql-nv.gqlexec.check_coverage")
+
+// ── The gap ──────────────────────────────────────────────────────────
+
+// Why subscriptions are not executed, as a sentence.
+//
+// Published rather than left to a README so a caller that reaches
+// `GqlUnsupported("subscription")` can print the reason.  The missing
+// half is the TRANSPORT — the graphql-ws sub-protocol over a
+// WebSocket, which is websocket-nv's surface plus a message protocol
+// of its own — and not § 6.2.3's source event stream, which is a
+// resolver answering many values instead of one.
+//
+// ```novo
+// use gqlexec
+//
+// fn main() [io]
+//     println(gqlexec.subscription_gap())
+// ```
+pub fn subscription_gap() -> Str []
+    todo("graphql-nv.gqlexec.subscription_gap")

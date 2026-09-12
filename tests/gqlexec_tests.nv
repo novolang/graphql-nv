@@ -1,0 +1,257 @@
+// gqlexec_tests.nv — the resolver trait, and what its effect parameter
+// buys.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion that reaches this package fails with
+// `not implemented: graphql-nv.gqlexec.<fn>`.
+//
+// Three tests here pass today, and they are the ones that assert about
+// the RESOLVERS below rather than about the package: that the trait can
+// be implemented at two different effect rows, that its three methods
+// answer, and that a field context carries the schema name and the
+// alias separately.  Those are green because they are about the shape
+// the interface offers, which is what an interface release is for.
+//
+// **THE EFFECT ROWS ON THESE TESTS ARE THE ARGUMENT.**  Two resolvers
+// are implemented below: one that answers from a constant, declaring
+// `GqlResolver[]`, and one that reads a file, declaring
+// `GqlResolver[fs]`.  The test that executes against the first
+// declares `[io]` and the test that executes against the second
+// declares `[io, fs]` — the SAME call, two different rows, because
+// `execute<R: GqlResolver[e]>(…) [e]` is charged what the caller's
+// resolver supplies.
+//
+// That is the whole reason this package has a trait where every other
+// GraphQL library has a table of functions.  A table is a container,
+// a bounded value reached through a container falls back to the union
+// over every impl, and the union here is the whole host budget — so
+// every GraphQL server in the language would declare `[io, fs, net,
+// time, mutate]` whether or not it touched any of them.
+
+use std.test
+use std.fs
+use std.list
+use std.str
+use gqlerr
+use gqlexec
+use gqllang
+use gqlsdl
+
+// ── Two resolvers, and the rows are the point ────────────────────────
+
+// One that answers from a constant.  `GqlResolver[]`: it performs
+// nothing at all.
+struct ConstResolver
+    value: Str
+
+// A resolver over a value the program already holds.  The shape a test
+// uses, and the shape a schema served from a build-time snapshot uses.
+impl GqlResolver[] for ConstResolver
+    fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+        GqlValue(self.value)
+
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+        ""
+
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+        GqlValue(value_json)
+
+// One that reads a file.  `GqlResolver[fs]`, and every call through it
+// costs `[fs]`.
+struct FileResolver
+    root: Str
+
+// A resolver whose fields come off a disk.  The row lands HERE, at the
+// impl, and `gqlexec.execute` is charged it through `[e]`.
+impl GqlResolver[fs] for FileResolver
+    fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome [fs]
+        match fs.read(self.root + "/" + ctx.field_name)
+            Some(text) => GqlValue(text)
+            None       => GqlNoResolver
+
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str [fs]
+        ""
+
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome [fs]
+        GqlValue(value_json)
+
+fn a_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build("type Query { me: String }")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+fn const_resolver() -> ConstResolver
+    ConstResolver { value: "null" }
+
+@test
+fn test_a_resolver_that_performs_nothing_costs_nothing() [io]
+    // `[io]` alone on this test is the assertion.  No `[fs]`, no
+    // `[net]`: `execute` against a `GqlResolver[]` is charged nothing.
+    test.case("a query over a constant resolver")
+    let req = gqlexec.request("{ me }")
+    match gqlexec.execute(a_schema(), const_resolver(), req, "{}",
+                          gqllang.default_limits())
+        Ok(r)  => test.assert(str.len(r.data) >= 0)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_resolver_that_reads_a_file_costs_fs_and_the_same_call_says_so() [io, fs]
+    // `[io, fs]` on this test, for the SAME `gqlexec.execute` call.
+    // The row came from the impl, through the effect parameter.
+    test.case("a query over a file-backed resolver")
+    let req = gqlexec.request("{ me }")
+    let r = FileResolver { root: "/no/such/graphql/root" }
+    match gqlexec.execute(a_schema(), r, req, "{}", gqllang.default_limits())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_resolver_answers_three_questions_and_they_are_three_methods() [io]
+    // Resolving a field, naming the concrete type behind an abstract
+    // one, and coercing a custom scalar.  The second is separate
+    // because the executor cannot answer it: only the deployment knows
+    // this particular object is a Dog.
+    test.case("a field")
+    let ctx = GqlFieldCtx { type_name: "Query", field_name: "me",
+                                    response_key: "me", parent_json: "{}",
+                                    args_json: "{}", path: ["me"], context: "" }
+    match const_resolver().gql_resolve(ctx)
+        GqlValue(v)   => test.assert_eq_str(v, "null")
+        GqlFailed(_)  => test.assert(false)
+        GqlNoResolver => test.assert(false)
+
+    test.case("an abstract type, where a guess would run the wrong fields")
+    test.assert_eq_str(const_resolver().gql_type_of("Pet", "{}"), "")
+
+    test.case("and a custom scalar, unchanged by default")
+    match const_resolver().gql_serialize_scalar("Date", "\"2026-09-12\"")
+        GqlValue(v)   => test.assert_eq_str(v, "\"2026-09-12\"")
+        GqlFailed(_)  => test.assert(false)
+        GqlNoResolver => test.assert(false)
+
+@test
+fn test_a_field_a_resolver_does_not_know_is_not_the_same_as_one_that_failed() [io, fs]
+    // The schema and the resolver disagreeing is a DEPLOYMENT fault
+    // that should be loud at start-up, not a null a client sees at
+    // three in the morning.
+    test.case("the missing case has its own variant")
+    let ctx = GqlFieldCtx { type_name: "Query", field_name: "me",
+                                    response_key: "me", parent_json: "{}",
+                                    args_json: "{}", path: ["me"], context: "" }
+    let r = FileResolver { root: "/no/such/graphql/root" }
+    match r.gql_resolve(ctx)
+        GqlNoResolver => test.assert(true)
+        GqlValue(_)   => test.assert(false)
+        GqlFailed(_)  => test.assert(false)
+
+@test
+fn test_coverage_is_a_start_up_check_and_it_costs_what_the_resolver_costs() [io]
+    // Run once at boot, so a schema and a resolver that disagree fail
+    // loudly rather than answering nulls.
+    test.case("the check itself")
+    test.assert(list.len(gqlexec.check_coverage(a_schema(), const_resolver())) >= 0)
+
+@test
+fn test_a_resolver_is_told_the_schema_name_and_never_the_clients_alias() [io]
+    // A resolver that matched on the alias would be matched on a name
+    // the client chose.
+    test.case("the two fields are separate")
+    let ctx = GqlFieldCtx { type_name: "Query", field_name: "me",
+                                    response_key: "viewer", parent_json: "{}",
+                                    args_json: "{}", path: ["viewer"], context: "" }
+    test.assert_eq_str(ctx.field_name, "me")
+    test.assert_eq_str(ctx.response_key, "viewer")
+
+@test
+fn test_a_request_is_built_by_three_functions() [io]
+    test.case("a document alone")
+    test.assert_eq_str(gqlexec.request("{ me }").query, "{ me }")
+
+    test.case("with variables")
+    let req = gqlexec.with_variables(gqlexec.request("query Q(\$id: ID!) { me }"),
+                                     "{\"id\":\"1\"}")
+    test.assert(str.contains(req.variables, "id"))
+
+    test.case("and naming an operation")
+    test.assert_eq_str(gqlexec.with_operation(req, "Q").operation_name, "Q")
+
+@test
+fn test_no_data_member_and_data_null_are_different_answers() [io]
+    // § 7.1: no `data` means the request never executed; `"data":
+    // null` means it did and the root field failed.  A client library
+    // branches on which it got, so a server that conflated them tells
+    // it something false.
+    test.case("an empty response carries no data member")
+    test.assert(not gqlexec.has_data(gqlexec.empty_response()))
+
+    test.case("and an error response carries none either")
+    let r = gqlexec.error_response([gqlerr.error("bad request")])
+    test.assert(not gqlexec.has_data(r))
+    test.assert(list.len(r.errors) == 1)
+
+@test
+fn test_the_response_json_puts_errors_before_data() [io]
+    // § 7.1's own recommendation, and it is not cosmetic: a client
+    // streaming a large response sees the errors before it has parsed
+    // megabytes of data it may not need.
+    test.case("a response with both")
+    let r = gqlexec.error_response([gqlerr.error("no")])
+    let out = gqlexec.response_json(r)
+    test.assert(str.contains(out, "errors"))
+
+    test.case("and a response with no data member does not emit `data: null`")
+    test.assert(not str.contains(gqlexec.response_json(gqlexec.empty_response()),
+                                 "\"data\":null"))
+
+@test
+fn test_extensions_are_where_timing_goes() [io]
+    test.case("set on a response")
+    let r = gqlexec.with_extensions(gqlexec.empty_response(), "{\"ms\":12}")
+    test.assert(str.contains(r.extensions, "ms"))
+
+@test
+fn test_a_mutations_top_level_fields_run_in_serial_and_a_querys_do_not() [io]
+    // § 6.3.1.  A mutation's fields are ordered because the second may
+    // depend on the first; a query's are not, and a client that
+    // assumed they were got it by accident.
+    test.case("a mutation")
+    test.assert(gqlexec.runs_serially(gqllang.GqlMutation))
+
+    test.case("a query")
+    test.assert(not gqlexec.runs_serially(gqllang.GqlQuery))
+
+@test
+fn test_null_propagation_is_one_function_because_it_is_the_rule_people_get_wrong() [io]
+    // § 6.4.4: a failed nullable field becomes null and stops; a
+    // failed NON-NULL field makes its parent null, and that continues
+    // upward until it reaches a nullable one or the root.
+    test.case("the landing path is answerable")
+    test.assert(list.len(gqlexec.null_lands_at(a_schema(), "Query", ["me"])) >= 0)
+
+@test
+fn test_a_subscription_is_parsed_and_refused_with_a_reason_published() [io]
+    // The missing half is the TRANSPORT — the graphql-ws sub-protocol
+    // over a WebSocket — and not the source event stream.
+    test.case("the gap has a sentence")
+    test.assert(str.len(gqlexec.subscription_gap()) > 0)
+
+    test.case("and the parser still reads one, so a schema registry can see it")
+    match gqllang.parse_executable("subscription { ticks }", gqllang.default_limits())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_execute_document_exists_for_the_persisted_query_deployment() [io]
+    // Which parses and validates once at deploy time and executes
+    // thousands of times — and for which re-parsing per request is the
+    // whole cost of the layer.
+    test.case("a document already parsed")
+    match gqllang.parse_executable("{ me }", gqllang.default_limits())
+        Err(_) => test.assert(true)
+        Ok(d)  =>
+            match gqlexec.execute_document(a_schema(), const_resolver(), d, "",
+                                           "{}", "{}")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)

@@ -1,0 +1,134 @@
+// gqlerr_tests.nv — the two error vocabularies, and the one thing a
+// client branches on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqlerr.<fn>`.
+
+use std.test
+use std.list
+use std.str
+use gqlerr
+
+@test
+fn test_an_error_carries_a_message_and_nothing_else_is_required() [io]
+    test.case("what a resolver answers when it has nothing more to say")
+    test.assert_eq_str(gqlerr.error("the account is suspended").message,
+                       "the account is suspended")
+
+    test.case("and it has no location and no path until somebody adds them")
+    let e = gqlerr.error("no")
+    test.assert(list.len(e.locations) == 0)
+    test.assert(list.len(e.path) == 0)
+
+@test
+fn test_a_code_in_extensions_is_what_a_client_branches_on() [io]
+    // `message` is prose and improves; a client that matched on prose
+    // breaks when it does.
+    test.case("the code round-trips")
+    let e = gqlerr.error_with_code("not signed in", "UNAUTHENTICATED")
+    test.assert_eq_str(gqlerr.code_of(e), "UNAUTHENTICATED")
+
+    test.case("an error with no code answers empty")
+    test.assert_eq_str(gqlerr.code_of(gqlerr.error("no")), "")
+
+    test.case("and extensions can be anything a deployment wants")
+    let f = gqlerr.with_extensions(gqlerr.error("no"), "{\"retryable\":true}")
+    test.assert(str.contains(f.extensions, "retryable"))
+
+@test
+fn test_a_location_is_one_based_because_an_editor_highlights_from_one() [io]
+    test.case("added to an error")
+    let e = gqlerr.at(gqlerr.error("unknown field"), 3, 5)
+    test.assert(list.len(e.locations) == 1)
+    test.assert(list.get(e.locations, 0, GqlLoc { line: 0, column: 0 }).line == 3)
+
+@test
+fn test_a_path_is_what_turns_an_error_into_something_an_application_can_act_on() [io]
+    // The client knows which of the forty fields it asked for is the
+    // null.  A library that omitted it produces errors nobody can use.
+    test.case("field names and list indices")
+    let e = gqlerr.at_path(gqlerr.error("no"), ["user", "posts", "2", "title"])
+    test.assert(list.len(e.path) == 4)
+
+    test.case("and printed the way a person reads one")
+    test.assert_eq_str(gqlerr.path_text(e), "user.posts.2.title")
+
+    test.case("an error with no path prints nothing")
+    test.assert_eq_str(gqlerr.path_text(gqlerr.error("no")), "")
+
+@test
+fn test_the_error_json_is_exactly_section_7_1_2s_shape() [io]
+    // A caller assembling it by hand assembles it slightly
+    // differently, at which point a client library stops recognising
+    // it.
+    test.case("message is in it")
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("no")), "message"))
+
+    test.case("and an error with a path carries the path")
+    let e = gqlerr.at_path(gqlerr.error("no"), ["user"])
+    test.assert(str.contains(gqlerr.error_json(e), "path"))
+
+@test
+fn test_a_fault_becomes_the_errors_a_response_would_carry() [io]
+    test.case("a syntax error is one error")
+    test.assert(list.len(gqlerr.errors_of(gqlerr.GqlSyntaxError("no", 1, 1))) == 1)
+
+    test.case("a validation failure is the list it already holds")
+    let v = gqlerr.GqlValidationFailed([gqlerr.error("a"), gqlerr.error("b")])
+    test.assert(list.len(gqlerr.errors_of(v)) == 2)
+
+    test.case("and a variable failure the same")
+    let b = gqlerr.GqlVariablesInvalid([gqlerr.error("a")])
+    test.assert(list.len(gqlerr.errors_of(b)) == 1)
+
+@test
+fn test_a_request_error_means_no_data_member_at_all() [io]
+    // § 7.1's distinction: no `data` means the request never executed;
+    // `"data": null` means it did and the root field failed.  A client
+    // can tell them apart and a server that conflated them tells it
+    // something false.
+    test.case("everything before execution")
+    test.assert(gqlerr.is_request_error(gqlerr.GqlSyntaxError("no", 1, 1)))
+    test.assert(gqlerr.is_request_error(gqlerr.GqlValidationFailed([])))
+    test.assert(gqlerr.is_request_error(gqlerr.GqlVariablesInvalid([])))
+    test.assert(gqlerr.is_request_error(gqlerr.GqlOperationNotFound("Q")))
+    test.assert(gqlerr.is_request_error(gqlerr.GqlRequestMalformed("no")))
+
+@test
+fn test_a_schema_that_cannot_exist_is_the_deployments_fault() [io]
+    // Every request against that deployment fails identically until
+    // somebody fixes the schema, which is a different alert from a
+    // client sending a bad query.
+    test.case("the schema, and nothing else")
+    test.assert(gqlerr.is_configuration_fault(gqlerr.GqlSchemaInvalid("no such type")))
+    test.assert(not gqlerr.is_configuration_fault(gqlerr.GqlSyntaxError("no", 1, 1)))
+
+@test
+fn test_a_message_about_the_clients_own_document_may_be_shown_to_it() [io]
+    // Telling a client what is wrong with the query it sent is the
+    // point; telling it what is wrong with the server's configuration
+    // is not.
+    test.case("the client's own document")
+    test.assert(gqlerr.is_client_safe(gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)))
+    test.assert(gqlerr.is_client_safe(gqlerr.GqlValidationFailed([])))
+    test.assert(gqlerr.is_client_safe(gqlerr.GqlTooLarge("depth", 40, 15)))
+
+    test.case("and the server's configuration is not")
+    test.assert(not gqlerr.is_client_safe(gqlerr.GqlSchemaInvalid("no such type")))
+
+@test
+fn test_a_limit_fault_carries_the_measurement_and_the_ceiling() [io]
+    // "Too large" without the numbers tells a client nothing it can
+    // act on — a query it can shorten by two levels is a query it
+    // should be told about.
+    test.case("both numbers")
+    let f = gqlerr.GqlTooLarge("depth", 40, 15)
+    test.assert(str.len(f.message()) > 0)
+    test.assert(gqlerr.is_request_error(f))
+
+@test
+fn test_the_unsupported_fault_names_the_feature() [io]
+    test.case("a subscription")
+    let f = gqlerr.GqlUnsupported("subscription")
+    test.assert(str.contains(f.message(), "subscription"))
+    test.assert(gqlerr.is_request_error(f))

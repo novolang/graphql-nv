@@ -1,0 +1,281 @@
+// gqlcheck_tests.nv — § 5's rules, and the one that is a security
+// control.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqlcheck.<fn>`.
+//
+// VALIDATION CANNOT FAIL, which is why every assertion below is about
+// a LIST rather than a `Result`: a document that does not satisfy the
+// schema is the ANSWER — a 400 whose body is the list — and modelling
+// it as an error would put a developer's typo on the failure path.
+
+use std.test
+use std.list
+use std.str
+use gqlcheck
+use gqllang
+use gqlsdl
+
+fn a_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build("interface Pet { name: String! }\n"
+            + "type Dog implements Pet { name: String! barks: Boolean }\n"
+            + "type Cat implements Pet { name: String! purrs: Boolean }\n"
+            + "type Query { pet: Pet me: String count(n: Int!): Int }")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+fn doc(src: Str) -> ?gqllang.GqlDocument
+    match gqllang.parse_executable(src, gqllang.no_limits())
+        Ok(d)  => Some(d)
+        Err(_) => None
+
+fn problems(src: Str) -> Int
+    match doc(src)
+        None    => 0 - 1
+        Some(d) => list.len(gqlcheck.validate(a_schema(), d))
+
+@test
+fn test_a_valid_document_produces_an_empty_list_rather_than_an_ok() [io]
+    test.case("nothing wrong")
+    test.assert(problems("{ me }") == 0)
+
+    test.case("and the predicate says the same")
+    match doc("{ me }")
+        None    => test.assert(false)
+        Some(d) => test.assert(gqlcheck.is_valid(a_schema(), d))
+
+@test
+fn test_every_problem_is_reported_rather_than_the_first() [io]
+    // A developer fixing six mistakes one round trip at a time is six
+    // round trips, and a schema-aware editor wants them all at once.
+    test.case("three unknown fields, three errors")
+    test.assert(problems("{ nope1 nope2 nope3 }") == 3)
+
+@test
+fn test_the_rule_list_is_the_contract() [io]
+    // "This validator implements § 5" is not a claim a reader can
+    // check.  Twenty-two names each with a test is.
+    test.case("the names are the specification's")
+    test.assert(list.len(gqlcheck.rule_names()) == 22)
+
+    test.case("and each names its section")
+    test.assert_eq_str(gqlcheck.rule_section("Fragment spreads must not form cycles"),
+                       "5.5.2.2")
+
+@test
+fn test_a_rule_can_be_applied_alone_or_skipped_by_name() [io]
+    // For an editor highlighting unknown fields as you type — which
+    // does not want "Fragments must be used" firing on every keystroke
+    // of a fragment being written — and for a gateway that splices
+    // fragments in later.
+    match doc("{ nope }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.case("one rule alone")
+            let only = ["Field selections must exist on the type"]
+            test.assert(list.len(gqlcheck.validate_only(a_schema(), d, only)) == 1)
+
+            test.case("and the same rule skipped")
+            test.assert(list.len(gqlcheck.validate_except(a_schema(), d, only)) == 0)
+
+@test
+fn test_a_fragment_cycle_is_a_single_request_denial_of_service() [io]
+    // `fragment A on X { ...B }` with `fragment B on X { ...A }` is a
+    // document that expands forever.  A server that validated
+    // everything else and not this one costs a client one request to
+    // take down.
+    test.case("a two-fragment cycle is found")
+    match doc("{ pet { ...A } }\n"
+            + "fragment A on Pet { name ...B }\n"
+            + "fragment B on Pet { name ...A }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.fragment_cycle(d)) >= 2)
+
+    test.case("a fragment that spreads itself is a cycle of one")
+    match doc("{ pet { ...A } } fragment A on Pet { name ...A }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.fragment_cycle(d)) >= 1)
+
+    test.case("and an acyclic document has none")
+    match doc("{ pet { ...A } } fragment A on Pet { name }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.fragment_cycle(d)) == 0)
+
+@test
+fn test_two_selections_on_one_response_key_must_merge() [io]
+    // § 5.3.2, the rule with the most implementation behind it and the
+    // least visibility.  A server that skipped it produces a response
+    // whose shape depends on field order.
+    test.case("two different fields under one alias do not merge")
+    match doc("{ a: me a: count(n: 1) }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.merge_conflicts(a_schema(), d)) == 1)
+
+    test.case("two aliases of one field do")
+    match doc("{ a: me b: me }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.merge_conflicts(a_schema(), d)) == 0)
+
+    test.case("and the same field twice with the SAME arguments does")
+    match doc("{ a: count(n: 1) a: count(n: 1) }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.merge_conflicts(a_schema(), d)) == 0)
+
+    test.case("with DIFFERENT arguments it does not")
+    match doc("{ a: count(n: 1) a: count(n: 2) }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.merge_conflicts(a_schema(), d)) == 1)
+
+@test
+fn test_a_composite_field_needs_a_selection_set_and_a_leaf_refuses_one() [io]
+    // § 5.3.3, the two most common mistakes in a hand-written query.
+    test.case("a composite with no selection set")
+    test.assert(problems("{ pet }") == 1)
+
+    test.case("a leaf with one")
+    test.assert(problems("{ me { name } }") == 1)
+
+@test
+fn test_both_variable_directions_are_checked() [io]
+    // An undeclared variable is a query that cannot run; an unused one
+    // is usually a field somebody deleted and a parameter they did
+    // not.
+    test.case("used and not declared")
+    match doc("query Q { count(n: \$n) }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.variable_problems(a_schema(), d)) == 1)
+
+    test.case("declared and not used")
+    match doc("query Q(\$n: Int!) { me }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.variable_problems(a_schema(), d)) == 1)
+
+    test.case("and both, which is two problems")
+    match doc("query Q(\$a: Int!) { count(n: \$b) }")
+        None    => test.assert(false)
+        Some(d) => test.assert(list.len(gqlcheck.variable_problems(a_schema(), d)) == 2)
+
+@test
+fn test_a_fragment_that_can_never_match_is_almost_always_a_half_edited_query() [io]
+    // § 5.5.2.3.  `... on Dog` inside a `Cat` selection is a fragment
+    // that can never apply.
+    test.case("an impossible spread")
+    match doc("{ pet { ... on Dog { ... on Cat { purrs } } } }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(gqlcheck.impossible_fragments(a_schema(), d)) == 1)
+
+    test.case("and a possible one")
+    match doc("{ pet { ... on Dog { barks } } }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(gqlcheck.impossible_fragments(a_schema(), d)) == 0)
+
+@test
+fn test_a_variable_is_coerced_before_execution_begins() [io]
+    // Which is what makes a bad variable a request error with NO
+    // `data` member rather than a field error with one.
+    test.case("a variable that fits")
+    match doc("query Q(\$n: Int!) { count(n: \$n) }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "Q")
+                Err(_) => test.assert(false)
+                Ok(op) =>
+                    match gqlcheck.coerce_variables(a_schema(), op, "{\"n\":1}")
+                        Ok(_)  => test.assert(true)
+                        Err(_) => test.assert(false)
+
+    test.case("and one that does not")
+    match doc("query Q(\$n: Int!) { count(n: \$n) }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "Q")
+                Err(_) => test.assert(false)
+                Ok(op) =>
+                    match gqlcheck.coerce_variables(a_schema(), op, "{\"n\":\"x\"}")
+                        Ok(_)  => test.assert(false)
+                        Err(_) => test.assert(true)
+
+@test
+fn test_an_id_accepts_a_string_or_an_integer_and_serialises_as_a_string() [io]
+    // § 3.5.5, and the rule that surprises everybody.  A checker that
+    // required a string rejects half the clients in the world.
+    test.case("a string")
+    match gqllang.parse_type("ID!")
+        None    => test.assert(false)
+        Some(t) => test.assert(gqlcheck.value_fits(a_schema(), "\"42\"", t))
+
+    test.case("and an integer")
+    match gqllang.parse_type("ID!")
+        None    => test.assert(false)
+        Some(t) => test.assert(gqlcheck.value_fits(a_schema(), "42", t))
+
+    test.case("but not a float, and not a boolean")
+    match gqllang.parse_type("ID!")
+        None    => test.assert(false)
+        Some(t) =>
+            test.assert(not gqlcheck.value_fits(a_schema(), "1.5", t))
+            test.assert(not gqlcheck.value_fits(a_schema(), "true", t))
+
+@test
+fn test_a_non_null_type_does_not_fit_a_null() [io]
+    test.case("null against Int!")
+    match gqllang.parse_type("Int!")
+        None    => test.assert(false)
+        Some(t) => test.assert(not gqlcheck.value_fits(a_schema(), "null", t))
+
+    test.case("and null against Int is fine")
+    match gqllang.parse_type("Int")
+        None    => test.assert(false)
+        Some(t) => test.assert(gqlcheck.value_fits(a_schema(), "null", t))
+
+@test
+fn test_skip_and_include_are_one_function_because_together_they_are_a_conjunction() [io]
+    // § 3.13: when BOTH are present the field is included only if
+    // `@skip(if: false)` AND `@include(if: true)`.  A caller that
+    // evaluated them separately would apply whichever it checked last.
+    test.case("neither directive")
+    test.assert(gqlcheck.selection_included(gqllang.field_selection("me"), "{}"))
+
+@test
+fn test_a_directive_must_be_defined_and_in_a_location_it_may_appear() [io]
+    test.case("an undefined directive")
+    match doc("{ me @nope }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(gqlcheck.directive_problems(a_schema(), d)) == 1)
+
+    test.case("a defined one in the right place")
+    match doc("query Q(\$s: Boolean!) { me @skip(if: \$s) }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(gqlcheck.directive_problems(a_schema(), d)) == 0)
+
+    test.case("and a non-repeatable directive twice, which is invalid rather than last-wins")
+    match doc("query Q(\$s: Boolean!) { me @skip(if: \$s) @skip(if: \$s) }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(gqlcheck.directive_problems(a_schema(), d)) == 1)
+
+@test
+fn test_an_anonymous_operation_may_not_share_a_document() [io]
+    // § 5.2.2.1.  A document with a bare selection set and a named
+    // operation has no way to say which one a request means.
+    test.case("refused")
+    test.assert(problems("{ me } query Q { me }") >= 1)
+
+@test
+fn test_what_is_deliberately_not_checked_is_published() [io]
+    // So a deployment auditing its GraphQL layer reads it from the
+    // code rather than from a README.
+    test.case("the list exists")
+    test.assert(list.len(gqlcheck.unchecked_rules()) >= 1)
+
+    test.case("and a custom scalar's own validity is on it")
+    var names = ""
+    for r in gqlcheck.unchecked_rules()
+        names = names + r
+    test.assert(str.contains(names, "scalar"))

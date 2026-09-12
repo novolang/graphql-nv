@@ -1,0 +1,546 @@
+// gqllang.nv — the query language: a lexer and a document parser, both
+// `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// OCTOBER 2021 IS THE TARGET, and the three things it adds over June
+// 2018 that an implementation notices are named here so a reader of a
+// June 2018 book knows what changed:
+//
+//   · an interface may implement other interfaces (§ 3.7), which turns
+//     interface conformance from one check into a transitive one;
+//   · a directive may be `repeatable` (§ 3.13), and introspection
+//     answers `__Directive.isRepeatable`;
+//   · `@specifiedBy(url:)` on a custom scalar (§ 3.5.7), which is a
+//     directive with a meaning rather than a new syntax.
+//
+// The June 2018 differences that are NOT differences: block strings,
+// descriptions on definitions, and the `null` literal are all in both.
+//
+// ONE PARSE, TWO ENTRY POINTS, AND THEY ARE DIFFERENT GRAMMARS.
+// § 2.2's `Document` admits executable definitions AND type-system
+// definitions, and a real deployment never wants both: a query
+// document carrying a `type User { … }` is a client trying to change
+// the schema, and an SDL document carrying `query { me }` is a
+// configuration file with a request in it.  So `parse_executable` is
+// here and `gqlsdl.parse` is next door, each refusing the other's
+// definitions by name — which is a security property for the first of
+// them and a diagnostic for the second.
+//
+// EVERY NODE CARRIES A LOCATION, because § 7.1.2 requires an error to
+// name one and because a validator that could not would answer "field
+// not found" with no line.  Locations are one-based and counted in
+// CHARACTERS, since a column measured in bytes points into the middle
+// of a name as soon as somebody uses one.
+//
+// THE LIMITS ARE CHECKED AT THE PARSE, NOT AFTER.  A query language
+// that lets a client send a document of arbitrary depth is a denial of
+// service with a schema attached: `{a{a{a{a{…}}}}}` costs the server
+// its stack before any validation rule has run.  `GqlLimits` is
+// checked as the parse descends, so a document past a bound is refused
+// at the byte it crossed it rather than after it has been built.
+
+use gqlerr
+
+// What kind of operation a definition is (§ 2.3).
+pub enum GqlOpKind
+    // A read.  The default when a document is a bare selection set.
+    GqlQuery
+    // A write.  The only kind whose top-level fields are executed in
+    // SERIAL (§ 6.3.1) — a query's are not, and a client that assumed
+    // ordering from a query got it by accident.
+    GqlMutation
+    // A stream.  PARSED, and refused at execution: see `gqlexec`.
+    GqlSubscription
+
+// A type as a query or a schema writes one: a name, a list, or a
+// non-null wrapper (§ 2.11).
+pub struct GqlTypeRef
+    // The innermost named type: `String`, `User`.
+    name: Str
+    // How many list wrappers, outermost last.  `[[User]]` is two.
+    list_depth: Int
+    // Whether each level is non-null, innermost first, one entry per
+    // level plus one for the named type.  `[User!]!` is
+    // `[true, true]`; `[User]!` is `[false, true]`.
+    //
+    // A list rather than two booleans because nullability nests
+    // arbitrarily, and a type that modelled only the outer one answers
+    // wrongly for `[User!]` — where a null ELEMENT is an error and a
+    // null LIST is not.
+    non_null: [Bool]
+
+// A value as written in a document (§ 2.9), including a variable
+// reference.
+//
+// Kept as TEXT with a kind rather than coerced, because coercing needs
+// the schema — `1` is an `Int`, a `Float`, an `ID` or a custom scalar
+// depending on where it appears, and a parser that guessed would have
+// to be corrected by the validator anyway.
+pub struct GqlValueNode
+    // One of `variable`, `int`, `float`, `string`, `boolean`, `null`,
+    // `enum`, `list`, `object`.  The nine § 2.9 names, as strings, so
+    // a reader of a diagnostic sees the specification's own word.
+    kind: Str
+    // The literal text, for a scalar; the variable's name, for a
+    // variable; empty for a list or an object.
+    text: Str
+    // The elements of a list, or the values of an object's fields.
+    items: [GqlValueNode]
+    // An object's field names, in order, parallel to `items`.
+    names: [Str]
+    // Where it is.
+    loc: gqlerr.GqlLoc
+
+// An argument as written: a name and a value.
+pub struct GqlArgNode
+    name: Str
+    value: GqlValueNode
+    loc: gqlerr.GqlLoc
+
+// A directive as written: `@name(args)`.
+pub struct GqlDirectiveNode
+    name: Str
+    args: [GqlArgNode]
+    loc: gqlerr.GqlLoc
+
+// One entry in a selection set (§ 2.4): a field, a fragment spread, or
+// an inline fragment.
+//
+// One struct with a `kind` rather than three variants, because the
+// three share almost every field and a caller walking a selection set
+// branches on the kind once instead of matching three shapes at every
+// level.
+pub struct GqlSelection
+    // `field`, `spread`, or `inline`.
+    kind: Str
+    // The field's name, or the fragment's name for a spread.  Empty
+    // for an inline fragment.
+    name: Str
+    // The alias, for a field.  Empty where there is none — and where
+    // there is none the RESPONSE KEY is the name, which is what
+    // § 6.3.2's field collection groups by.
+    alias_name: Str
+    // The arguments, for a field.
+    args: [GqlArgNode]
+    // The directives on this selection.
+    directives: [GqlDirectiveNode]
+    // The type condition, for an inline fragment or a spread's
+    // definition.  Empty where there is none.
+    type_condition: Str
+    // The nested selections.
+    selections: [GqlSelection]
+    // Where it is.
+    loc: gqlerr.GqlLoc
+
+// A variable declaration on an operation (§ 2.10).
+pub struct GqlVarDef
+    // The name, without the `$`.
+    name: Str
+    // The declared type.
+    type_ref: GqlTypeRef
+    // The default, or `None`.
+    default_value: ?GqlValueNode
+    // Directives on the variable definition.
+    directives: [GqlDirectiveNode]
+    loc: gqlerr.GqlLoc
+
+// An operation definition (§ 2.3).
+pub struct GqlOperation
+    kind: GqlOpKind
+    // The name, empty for an anonymous operation.  A document with an
+    // anonymous operation may have NO other operation (§ 5.2.2.1), and
+    // that rule is `gqlcheck`'s.
+    name: Str
+    variables: [GqlVarDef]
+    directives: [GqlDirectiveNode]
+    selections: [GqlSelection]
+    loc: gqlerr.GqlLoc
+
+// A fragment definition (§ 2.8).
+pub struct GqlFragment
+    name: Str
+    // The type this fragment applies to.  Required — § 2.8's grammar
+    // has no fragment without one.
+    type_condition: Str
+    directives: [GqlDirectiveNode]
+    selections: [GqlSelection]
+    loc: gqlerr.GqlLoc
+
+// A parsed executable document (§ 2.2).
+pub struct GqlDocument
+    operations: [GqlOperation]
+    fragments: [GqlFragment]
+
+// What a deployment will parse.
+//
+// Checked AS THE PARSE DESCENDS, not after it: a document of arbitrary
+// depth costs the server its stack before any validation rule has run.
+pub struct GqlLimits
+    // The deepest selection set.  Fifteen by default — deeper than any
+    // hand-written query and far shallower than `{a{a{a{…}}}}`.
+    max_depth: Int
+    // The most selections in one set.
+    max_breadth: Int
+    // The most bytes in the document.
+    max_bytes: Int
+    // The most ALIASES in the document.  Its own number because
+    // aliasing is the cheap amplifier: `{a:me b:me c:me …}` is one
+    // field resolved a thousand times from a document a thousand
+    // characters long, and a depth limit does not see it.
+    max_aliases: Int
+    // The most fragment spreads, which bound the cost of expanding
+    // them.
+    max_spreads: Int
+
+// The conventional limits.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqllang.default_limits().max_depth}")
+// ```
+pub fn default_limits() -> GqlLimits []
+    todo("graphql-nv.gqllang.default_limits")
+
+// Limits with no ceiling at all.
+//
+// For a trusted document — one this deployment wrote, persisted and
+// hashed — where the bounds are cost with no benefit.  Named rather
+// than reachable by setting five fields to zero, so that a deployment
+// that uses it has said so.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqllang.no_limits().max_depth}")
+// ```
+pub fn no_limits() -> GqlLimits []
+    todo("graphql-nv.gqllang.no_limits")
+
+// Limits a caller chose.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqllang.limits(10, 50, 16384, 100, 50).max_depth}")
+// ```
+pub fn limits(max_depth: Int, max_breadth: Int, max_bytes: Int, max_aliases: Int,
+              max_spreads: Int) -> GqlLimits []
+    todo("graphql-nv.gqllang.limits")
+
+// ── Parsing ──────────────────────────────────────────────────────────
+
+// An executable document: operations and fragments, and nothing else.
+//
+// Refuses a type-system definition BY NAME — `type`, `schema`,
+// `directive`, `extend` and the rest — rather than ignoring it.  A
+// query document carrying `type User { … }` is a client trying to
+// change the schema, and a parser that quietly dropped it would give a
+// deployment no way to notice.
+//
+// ```novo
+// use std.list
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me { name } }", gqllang.default_limits())
+//         Ok(d)  => println("${list.len(d.operations)}")
+//         Err(_) => println("not an executable document")
+// ```
+pub fn parse_executable(source: Str, lim: GqlLimits) -> Result<GqlDocument, gqlerr.GqlFault> []
+    todo("graphql-nv.gqllang.parse_executable")
+
+// The operation a request means (§ 6.1).
+//
+// With a name: that operation, or `GqlOperationNotFound`.  Without:
+// the document's only operation, or `GqlOperationNotFound` when there
+// is more than one — which is § 6.1's refusal and not a guess at the
+// first.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  =>
+//             match gqllang.operation_of(d, "")
+//                 Ok(op) => println(op.name)
+//                 Err(_) => println("which operation?")
+// ```
+pub fn operation_of(d: GqlDocument, name: Str) -> Result<GqlOperation, gqlerr.GqlFault> []
+    todo("graphql-nv.gqllang.operation_of")
+
+// A fragment by name, or `None`.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  =>
+//             match gqllang.fragment_of(d, "UserBits")
+//                 Some(f) => println(f.name)
+//                 None    => println("no such fragment")
+// ```
+pub fn fragment_of(d: GqlDocument, name: Str) -> ?GqlFragment []
+    todo("graphql-nv.gqllang.fragment_of")
+
+// A document printed back out, canonically.
+//
+// Two spaces of indentation, arguments in source order, no comments —
+// which makes it a normaliser rather than a formatter: a persisted-query
+// deployment hashes THIS rather than what the client sent, so two
+// clients that wrote the same query with different whitespace get the
+// same hash.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{me{name}}", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  => println(gqllang.print_document(d))
+// ```
+pub fn print_document(d: GqlDocument) -> Str []
+    todo("graphql-nv.gqllang.print_document")
+
+// One selection set printed, for a diagnostic.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me { name } }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  =>
+//             match gqllang.operation_of(d, "")
+//                 Err(_) => println("no")
+//                 Ok(op) => println(gqllang.print_selections(op.selections))
+// ```
+pub fn print_selections(ss: [GqlSelection]) -> Str []
+    todo("graphql-nv.gqllang.print_selections")
+
+// ── Values ───────────────────────────────────────────────────────────
+
+// A value as written, printed back (§ 3.12's value syntax).
+//
+// What a diagnostic quotes and what an SDL default is written with.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println(gqllang.print_value(gqllang.parse_value("{a: 1}") ?? gqllang.null_value()))
+// ```
+pub fn print_value(v: GqlValueNode) -> Str []
+    todo("graphql-nv.gqllang.print_value")
+
+// A standalone value, for a default or a directive argument read out
+// of context.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_value("[1, 2, 3]")
+//         Some(v) => println(v.kind)
+//         None    => println("not a value")
+// ```
+pub fn parse_value(source: Str) -> ?GqlValueNode []
+    todo("graphql-nv.gqllang.parse_value")
+
+// The `null` literal as a value node.
+//
+// Published because a null LITERAL and an ABSENT argument are
+// different things (§ 2.9.6): `field(x: null)` explicitly passes null,
+// `field` does not pass `x` at all, and a default value applies to the
+// second and not the first.  A caller building a value node needs to
+// be able to say the first.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println(gqllang.null_value().kind)
+// ```
+pub fn null_value() -> GqlValueNode []
+    todo("graphql-nv.gqllang.null_value")
+
+// ── Types as written ─────────────────────────────────────────────────
+
+// A type reference parsed from its written form: `[User!]!`.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_type("[User!]!")
+//         Some(t) => println("${t.list_depth}")
+//         None    => println("not a type")
+// ```
+pub fn parse_type(source: Str) -> ?GqlTypeRef []
+    todo("graphql-nv.gqllang.parse_type")
+
+// A type reference printed back out.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_type("[User!]!")
+//         None    => println("no")
+//         Some(t) => println(gqllang.print_type(t))
+// ```
+pub fn print_type(t: GqlTypeRef) -> Str []
+    todo("graphql-nv.gqllang.print_type")
+
+// A named type with no wrappers.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println(gqllang.print_type(gqllang.named_type("String")))
+// ```
+pub fn named_type(name: Str) -> GqlTypeRef []
+    todo("graphql-nv.gqllang.named_type")
+
+// Whether the OUTERMOST level of a type is non-null.
+//
+// The question that decides whether a null at this position is an
+// error, and the one a two-boolean type gets wrong for `[User!]`:
+// there, a null ELEMENT is an error and a null LIST is not.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_type("[User!]")
+//         None    => println("no")
+//         Some(t) => println("${gqllang.is_non_null(t)}")
+// ```
+pub fn is_non_null(t: GqlTypeRef) -> Bool []
+    todo("graphql-nv.gqllang.is_non_null")
+
+// Whether the outermost level is a list.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_type("[User]")
+//         None    => println("no")
+//         Some(t) => println("${gqllang.is_list(t)}")
+// ```
+pub fn is_list(t: GqlTypeRef) -> Bool []
+    todo("graphql-nv.gqllang.is_list")
+
+// The type one wrapper in: `[User!]!` becomes `[User!]`, then `User!`,
+// then `User`.
+//
+// How an executor walks a type while it walks a value.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_type("[User!]!")
+//         None    => println("no")
+//         Some(t) => println(gqllang.print_type(gqllang.inner_type(t)))
+// ```
+pub fn inner_type(t: GqlTypeRef) -> GqlTypeRef []
+    todo("graphql-nv.gqllang.inner_type")
+
+// ── Measurements ─────────────────────────────────────────────────────
+
+// How deep a document's deepest selection set is.
+//
+// Published so a deployment can log the measurement it is bounding,
+// and so a limit can be chosen from what real clients send rather than
+// guessed.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ a { b { c } } }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  => println("${gqllang.depth_of(d)}")
+// ```
+pub fn depth_of(d: GqlDocument) -> Int []
+    todo("graphql-nv.gqllang.depth_of")
+
+// How many aliases a document uses.
+//
+// The cheap amplifier: `{a:me b:me c:me …}` is one field resolved a
+// thousand times from a document a thousand characters long, and a
+// depth limit does not see it.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ a: me b: me }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  => println("${gqllang.alias_count(d)}")
+// ```
+pub fn alias_count(d: GqlDocument) -> Int []
+    todo("graphql-nv.gqllang.alias_count")
+
+// How many fields a document names in total, fragments expanded.
+//
+// A rough complexity measure, and it says so: a real cost model
+// weights fields by what resolving them does, which is a deployment's
+// knowledge and not a parser's.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me { name email } }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  => println("${gqllang.field_count(d)}")
+// ```
+pub fn field_count(d: GqlDocument) -> Int []
+    todo("graphql-nv.gqllang.field_count")
+
+// The response key of a selection: its alias where it has one, its
+// name otherwise.
+//
+// The key § 6.3.2's field collection groups by, and the key the
+// response object uses.  One function because two places need it to
+// agree, and because a caller reading `.name` for the response key is
+// the bug that makes aliased fields disappear.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ a: me }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  =>
+//             match gqllang.operation_of(d, "")
+//                 Err(_) => println("no")
+//                 Ok(op) => println(gqllang.response_key(list.get(op.selections, 0,
+//                                       gqllang.field_selection("x"))))
+// ```
+pub fn response_key(s: GqlSelection) -> Str []
+    todo("graphql-nv.gqllang.response_key")
+
+// A bare field selection, for building a document by hand and for a
+// default in a lookup.
+//
+// ```novo
+// use gqllang
+//
+// fn main() [io]
+//     println(gqllang.field_selection("me").name)
+// ```
+pub fn field_selection(name: Str) -> GqlSelection []
+    todo("graphql-nv.gqllang.field_selection")

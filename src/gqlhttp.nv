@@ -1,0 +1,383 @@
+// gqlhttp.nv — the shape a `web` row mounts: a request read out of a
+// body or a query, and a response written back.  `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE PERFORMS ANYTHING, and that is the whole reason it is a
+// separate module.  A GraphQL transport is a small amount of parsing
+// and a large amount of POLICY — which method, which media type, which
+// status — and every one of those decisions is a value a test can
+// assert.  The socket belongs to the caller's server; this module
+// turns bytes into a `GqlRequest` and a `GqlResponse` into bytes.
+//
+// THE STATUS CODE IS THE PART THE GRAPHQL OVER HTTP SPECIFICATION
+// EXISTS TO SETTLE, and the answer is not what a reader expects.
+//
+//   · A response carrying `errors` is a **200**, as long as execution
+//     began.  The query ran, some fields failed, the body says which —
+//     and a client library that retried on 5xx would, against a server
+//     that answered 500 for a failed resolver, retry every partial
+//     success forever.
+//   · A request that never became an execution — a syntax error, a
+//     validation failure, a bad variable — is a 200 under the LEGACY
+//     media type `application/json`, and a **400** under
+//     `application/graphql-response+json`.
+//
+// That second line is the whole of the specification's compatibility
+// story: the status depends on what the client ASKED FOR, because
+// existing clients were written against servers that answered 200 for
+// everything and changing it under them would break them.
+// `status_for` takes the negotiated media type for exactly this
+// reason, and `negotiate` is what picks it.
+//
+// GET IS FOR QUERIES ONLY, AND THAT IS NOT PEDANTRY.  A mutation over
+// GET is a mutation a browser will prefetch, a proxy will cache and a
+// crawler will follow — `<img src="/graphql?query=mutation{deleteAll}">`
+// on any page anywhere.  `read_get` refuses a mutation with a 405 and
+// an `Allow: POST`, which is the answer that tells the client what to
+// do instead.
+
+use formurl
+use gqlerr
+use gqlexec
+
+// What a deployment allows over HTTP.
+pub struct GqlHttpPolicy
+    // Whether GET is accepted at all.  True: a GET query is
+    // cacheable, which is the whole reason the specification kept it.
+    allow_get: Bool
+    // Whether a mutation over GET is accepted.  FALSE, and it stays
+    // false: a mutation a browser can prefetch is a mutation a crawler
+    // will perform.
+    allow_get_mutation: Bool
+    // The largest request body, in bytes.
+    max_body_bytes: Int
+    // Whether `extensions` in the request is read.  True; a persisted
+    // query identifier arrives there.
+    read_extensions: Bool
+
+// The conventional policy.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println("${gqlhttp.defaults().allow_get_mutation}")
+// ```
+pub fn defaults() -> GqlHttpPolicy []
+    todo("graphql-nv.gqlhttp.defaults")
+
+// The same, refusing GET entirely.
+//
+// For a deployment behind a cache it does not want GraphQL responses
+// in.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println("${gqlhttp.post_only().allow_get}")
+// ```
+pub fn post_only() -> GqlHttpPolicy []
+    todo("graphql-nv.gqlhttp.post_only")
+
+// ── Reading a request ────────────────────────────────────────────────
+
+// A POST body read into a request.
+//
+// The body is JSON with `query`, and optionally `operationName`,
+// `variables` and `extensions`.  Refuses a body that is not a JSON
+// object, one with no `query`, and one whose `variables` is not an
+// object — each named, because "bad request" about a forty-line body
+// is not something a developer can act on.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     match gqlhttp.read_post("{\"query\":\"{ me }\"}", gqlhttp.defaults())
+//         Ok(r)  => println(r.query)
+//         Err(_) => println("not a GraphQL request")
+// ```
+pub fn read_post(body: Str, p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlhttp.read_post")
+
+// A GET query string read into a request.
+//
+// `query`, `operationName`, `variables` and `extensions` as query
+// parameters, with the last two being JSON text inside them.
+//
+// Reads with form-nv, which SEES a repeated parameter: a request
+// carrying two `query` values is refused rather than half-read, where
+// `http.server.query_get` would answer the first and drop the rest.
+//
+// Does NOT refuse a mutation — the document has not been parsed yet.
+// `refuses_get_mutation` is that check, run after the parse.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     match gqlhttp.read_get("query=%7B%20me%20%7D", gqlhttp.defaults())
+//         Ok(r)  => println(r.query)
+//         Err(_) => println("not a GraphQL request")
+// ```
+pub fn read_get(query_string: Str,
+                p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlhttp.read_get")
+
+// The same, from a form body already parsed.
+//
+// For the caller that parsed the query for another reason.
+//
+// ```novo
+// use formurl
+// use gqlhttp
+//
+// fn main() [io]
+//     match gqlhttp.read_form(formurl.parse_str("query=%7Bme%7D"), gqlhttp.defaults())
+//         Ok(r)  => println(r.query)
+//         Err(_) => println("not a GraphQL request")
+// ```
+pub fn read_form(b: formurl.FormBody,
+                 p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlhttp.read_form")
+
+// Whether a GET must be refused because its document mutates.
+//
+// Run AFTER the parse, because that is when the operation's kind is
+// known.  `true` means answer a 405 with `Allow: POST` — which tells
+// the client what to do, where a 400 would only tell it that something
+// was wrong.
+//
+// A mutation over GET is a mutation a browser will prefetch, a proxy
+// will cache and a crawler will follow.
+//
+// ```novo
+// use gqlhttp
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlMutation)}")
+// ```
+pub fn refuses_get_mutation(p: GqlHttpPolicy, kind: gqllang.GqlOpKind) -> Bool []
+    todo("graphql-nv.gqlhttp.refuses_get_mutation")
+
+// The `Allow` header for a refused GET: `POST`.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println(gqlhttp.allow_header())
+// ```
+pub fn allow_header() -> Str []
+    todo("graphql-nv.gqlhttp.allow_header")
+
+// Whether a request's `Content-Type` is one this transport reads.
+//
+// `application/json` alone.  `application/graphql` was a proposal that
+// was never ratified and `application/x-www-form-urlencoded` is a
+// shape a CSRF form can produce — which is why a GraphQL endpoint that
+// accepts it has a cross-site request forgery on every mutation, and
+// why this answers false for it.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println("${gqlhttp.reads_content_type("application/json; charset=utf-8")}")
+// ```
+pub fn reads_content_type(content_type: Str) -> Bool []
+    todo("graphql-nv.gqlhttp.reads_content_type")
+
+// ── Writing a response ───────────────────────────────────────────────
+
+// The media type a request's `Accept` header negotiates to.
+//
+// `application/graphql-response+json` where the client asked for it,
+// `application/json` otherwise — which is the specification's own
+// default and the legacy behaviour.  The choice decides the STATUS
+// CODE, which is why it is a function rather than a constant.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println(gqlhttp.negotiate("application/graphql-response+json"))
+// ```
+pub fn negotiate(accept: Str) -> Str []
+    todo("graphql-nv.gqlhttp.negotiate")
+
+// The status a response gets, given the negotiated media type.
+//
+// The whole table:
+//
+//   · execution began, with or without errors → **200**, always;
+//   · a request error under `application/json` → **200**, because
+//     that is what clients written against the legacy behaviour
+//     expect;
+//   · a request error under `application/graphql-response+json` →
+//     **400**;
+//   · a variable coercion failure → the same two, by media type.
+//
+// A client library that retried on 5xx would, against a server that
+// answered 500 for a failed resolver, retry every partial success
+// forever.  That is the mistake this function exists to prevent, and
+// it is one somebody makes in every GraphQL server written by hand.
+//
+// ```novo
+// use gqlhttp
+// use gqlexec
+//
+// fn main() [io]
+//     let r = gqlexec.empty_response()
+//     println("${gqlhttp.status_for(r, "application/json")}")
+// ```
+pub fn status_for(r: gqlexec.GqlResponse, media_type: Str) -> Int []
+    todo("graphql-nv.gqlhttp.status_for")
+
+// The status for a request that never became an execution.
+//
+// Separate from `status_for` because there is no response to look at
+// — the fault IS the answer.
+//
+// ```novo
+// use gqlerr
+// use gqlhttp
+//
+// fn main() [io]
+//     let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
+//     println("${gqlhttp.status_for_fault(f, "application/graphql-response+json")}")
+// ```
+pub fn status_for_fault(f: gqlerr.GqlFault, media_type: Str) -> Int []
+    todo("graphql-nv.gqlhttp.status_for_fault")
+
+// The `Content-Type` header for a response in a media type.
+//
+// With `charset=utf-8`, which § 6.1 of the GraphQL over HTTP
+// specification requires and which a client that guessed would guess
+// right only until somebody's name has an accent in it.
+//
+// ```novo
+// use gqlhttp
+//
+// fn main() [io]
+//     println(gqlhttp.content_type("application/json"))
+// ```
+pub fn content_type(media_type: Str) -> Str []
+    todo("graphql-nv.gqlhttp.content_type")
+
+// The headers a response carries, in order.
+//
+// `Content-Type`, and `Allow` on a 405.  Published as a list so a
+// caller attaches them without deciding which.
+//
+// ```novo
+// use std.list
+// use gqlexec
+// use gqlhttp
+//
+// fn main() [io]
+//     let r = gqlexec.empty_response()
+//     println("${list.len(gqlhttp.response_headers(r, "application/json"))}")
+// ```
+pub fn response_headers(r: gqlexec.GqlResponse, media_type: Str) -> [(Str, Str)] []
+    todo("graphql-nv.gqlhttp.response_headers")
+
+// A fault as a response body, in the media type negotiated.
+//
+// ```novo
+// use gqlerr
+// use gqlhttp
+//
+// fn main() [io]
+//     let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
+//     println(gqlhttp.fault_body(f, "application/json"))
+// ```
+pub fn fault_body(f: gqlerr.GqlFault, media_type: Str) -> Str []
+    todo("graphql-nv.gqlhttp.fault_body")
+
+// ── Cross-site request forgery ───────────────────────────────────────
+
+// Whether a request's headers show it was sent by a program rather
+// than by a form a page on another site submitted.
+//
+// The check the GraphQL over HTTP specification recommends and does
+// not require: a request carrying a `Content-Type: application/json`,
+// or a non-empty `X-Apollo-Operation-Name` or `Apollo-Require-Preflight`
+// header, cannot have come from a plain HTML form — because a form can
+// only send three content types and none of them is JSON, and a
+// request carrying a custom header has been through a CORS preflight.
+//
+// Published because a GraphQL endpoint that accepts
+// `application/x-www-form-urlencoded` has a cross-site request forgery
+// on every mutation, and because the reasoning is not obvious enough
+// to leave to each deployment.
+//
+// ```novo
+// use gqlhttp
+//
+// fn no_headers(name: Str) -> Str
+//     ""
+//
+// fn main() [io]
+//     println("${gqlhttp.looks_preflighted(no_headers)}")
+// ```
+pub fn looks_preflighted(header: fn(Str) -> Str []) -> Bool []
+    todo("graphql-nv.gqlhttp.looks_preflighted")
+
+// The headers whose presence `looks_preflighted` accepts, as strings a
+// person can read.
+//
+// The list IS the contract: a deployment adding its own client header
+// to it is making a decision, and one reading the list can see what is
+// being trusted.
+//
+// ```novo
+// use std.list
+// use gqlhttp
+//
+// fn main() [io]
+//     println("${list.len(gqlhttp.preflight_headers())}")
+// ```
+pub fn preflight_headers() -> [Str] []
+    todo("graphql-nv.gqlhttp.preflight_headers")
+
+// ── Persisted queries ────────────────────────────────────────────────
+
+// The persisted-query hash a request's `extensions` carries, or empty.
+//
+// Apollo's automatic persisted queries put
+// `{"persistedQuery":{"version":1,"sha256Hash":"…"}}` there, and a
+// deployment that supports them looks the hash up rather than parsing
+// a document.  Reading the field is four lines nobody should write
+// twice; STORING the documents is a deployment's own business and this
+// package holds no table.
+//
+// ```novo
+// use gqlexec
+// use gqlhttp
+//
+// fn main() [io]
+//     println(gqlhttp.persisted_hash(gqlexec.request("{ me }")))
+// ```
+pub fn persisted_hash(req: gqlexec.GqlRequest) -> Str []
+    todo("graphql-nv.gqlhttp.persisted_hash")
+
+// The error a server answers for a persisted query it does not know.
+//
+// `PERSISTED_QUERY_NOT_FOUND` in `extensions.code`, which is the
+// convention every client implementing the protocol retries on — by
+// sending the document.  A deployment that answered anything else gets
+// a client that gives up instead.
+//
+// ```novo
+// use gqlerr
+// use gqlhttp
+//
+// fn main() [io]
+//     println(gqlerr.code_of(gqlhttp.persisted_not_found()))
+// ```
+pub fn persisted_not_found() -> gqlerr.GqlError []
+    todo("graphql-nv.gqlhttp.persisted_not_found")

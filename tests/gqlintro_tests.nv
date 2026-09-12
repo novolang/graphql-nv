@@ -1,0 +1,149 @@
+// gqlintro_tests.nv — introspection, and the decision to turn it off
+// that is usually argued badly.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqlintro.<fn>`.
+//
+// The interesting assertion in this file is that `__typename` answers
+// even with introspection off: it is available on every composite,
+// a client uses it to decide which fragment matched, and a server that
+// suppressed it would break every union query in the world for no
+// benefit — the type name is already in the response.
+
+use std.test
+use std.list
+use std.str
+use gqlintro
+use gqlsdl
+
+fn a_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build("type Query { me: String viewer: String }")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+@test
+fn test_the_three_meta_fields_are_named_once() [io]
+    // The executor and the validator both need the list and would
+    // otherwise carry it twice.
+    test.case("the three")
+    test.assert(gqlintro.is_meta_field("__typename"))
+    test.assert(gqlintro.is_meta_field("__schema"))
+    test.assert(gqlintro.is_meta_field("__type"))
+
+    test.case("and nothing else")
+    test.assert(not gqlintro.is_meta_field("__Type"))
+    test.assert(not gqlintro.is_meta_field("typename"))
+
+@test
+fn test_typename_answers_even_with_introspection_off() [io]
+    // A client uses it to decide which fragment matched, and the type
+    // name is in the response already — so suppressing it breaks every
+    // union query for no benefit.
+    test.case("with introspection on")
+    test.assert(gqlintro.answers(gqlintro.defaults(), "__typename"))
+
+    test.case("and with it off")
+    test.assert(gqlintro.answers(gqlintro.closed(), "__typename"))
+
+    test.case("where __schema and __type do not")
+    test.assert(gqlintro.answers(gqlintro.defaults(), "__schema"))
+    test.assert(not gqlintro.answers(gqlintro.closed(), "__schema"))
+    test.assert(not gqlintro.answers(gqlintro.closed(), "__type"))
+
+@test
+fn test_closing_introspection_closes_the_suggestions_too() [io]
+    // Turning `__schema` off and leaving the "did you mean" in the
+    // errors buys nothing: the schema is still discoverable, one field
+    // at a time.
+    test.case("both together")
+    let p = gqlintro.closed()
+    test.assert(not p.enabled)
+    test.assert(p.suggestions_off)
+
+    test.case("and by default both are on")
+    let d = gqlintro.defaults()
+    test.assert(d.enabled)
+    test.assert(not d.suggestions_off)
+
+@test
+fn test_a_suggestion_is_offered_or_not_by_policy() [io]
+    test.case("with suggestions on")
+    test.assert(str.len(gqlintro.suggest_field(a_schema(), gqlintro.defaults(),
+                                               "Query", "mee")) > 0)
+
+    test.case("and with them off, nothing")
+    test.assert_eq_str(gqlintro.suggest_field(a_schema(), gqlintro.closed(),
+                                              "Query", "mee"),
+                                              "")
+
+@test
+fn test_the_schema_and_type_fields_answer_json() [io]
+    test.case("__schema")
+    test.assert(str.len(gqlintro.schema_value(a_schema(), gqlintro.defaults())) > 0)
+
+    test.case("__type of a type that is there")
+    test.assert_some(gqlintro.type_value(a_schema(), gqlintro.defaults(), "Query"))
+
+    test.case("and of one that is not")
+    test.assert_none(gqlintro.type_value(a_schema(), gqlintro.defaults(), "Nope"))
+
+@test
+fn test_the_whole_document_is_producible_with_nothing_running() [io]
+    // Which is what makes a schema registry, a code generator and a
+    // linter not need a server.
+    test.case("from a schema value alone")
+    test.assert(str.contains(gqlintro.document(a_schema()), "__schema"))
+
+@test
+fn test_a_schema_comes_back_out_of_an_introspection_document() [io]
+    // The direction a gateway needs: a service answers its
+    // introspection query, the gateway turns it back into a schema and
+    // federates it.  Also what turns a downloaded schema.json into SDL.
+    test.case("a round trip")
+    match gqlintro.schema_of(gqlintro.document(a_schema()))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+    test.case("and a document that is not one is refused with what is missing named")
+    match gqlintro.schema_of("{}")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_introspection_query_is_published_so_a_test_asserts_against_a_known_one() [io]
+    test.case("the query graphql-js sends")
+    let q = gqlintro.introspection_query()
+    test.assert(str.contains(q, "__schema"))
+    test.assert(str.contains(q, "queryType"))
+
+@test
+fn test_the_meta_type_names_are_the_eight_section_4_5_reserves() [io]
+    test.case("eight of them")
+    test.assert(list.len(gqlintro.meta_type_names()) == 8)
+
+@test
+fn test_introspection_models_a_wrapper_as_a_type_which_sdl_does_not() [io]
+    // § 4.5's asymmetry, and the part a hand-written introspection
+    // answer gets wrong: a list is a `__Type` whose `kind` is `LIST`
+    // and whose `ofType` is the thing inside.
+    test.case("the six SDL kinds map across")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlScalar), "SCALAR")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlObject), "OBJECT")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlInterface), "INTERFACE")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlUnion), "UNION")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlEnum), "ENUM")
+    test.assert_eq_str(gqlintro.type_kind_name(gqlsdl.GqlInputObject), "INPUT_OBJECT")
+
+@test
+fn test_the_directive_locations_are_the_nineteen_section_3_13_defines() [io]
+    test.case("seven executable and twelve type-system")
+    test.assert(list.len(gqlintro.directive_locations()) == 19)
+
+@test
+fn test_deprecations_are_hidden_unless_a_query_asks() [io]
+    // § 4.5's `includeDeprecated` defaults to false, and this is the
+    // deployment-wide default behind it.
+    test.case("hidden by default")
+    test.assert(not gqlintro.defaults().include_deprecated)

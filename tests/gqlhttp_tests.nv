@@ -1,0 +1,216 @@
+// gqlhttp_tests.nv — the transport, whose whole content is policy.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqlhttp.<fn>`.
+//
+// THE STATUS TABLE IS THE POINT OF THIS FILE.  A response carrying
+// `errors` is a 200 as long as execution began, and a client library
+// that retried on 5xx would — against a server that answered 500 for a
+// failed resolver — retry every partial success forever.
+
+use std.test
+use std.list
+use std.str
+use gqlerr
+use gqlexec
+use gqlhttp
+use gqllang
+
+fn no_headers(name: Str) -> Str
+    ""
+
+fn json_headers(name: Str) -> Str
+    if name == "Content-Type"
+        "application/json"
+    else
+        ""
+
+fn legacy() -> Str
+    "application/json"
+
+fn modern() -> Str
+    "application/graphql-response+json"
+
+@test
+fn test_a_post_body_reads_the_four_members() [io]
+    test.case("query alone")
+    match gqlhttp.read_post("{\"query\":\"{ me }\"}", gqlhttp.defaults())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.query, "{ me }")
+
+    test.case("with an operation name and variables")
+    let body = "{\"query\":\"query Q { me }\",\"operationName\":\"Q\","
+        + "\"variables\":{\"a\":1}}"
+    match gqlhttp.read_post(body, gqlhttp.defaults())
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert_eq_str(r.operation_name, "Q")
+            test.assert(str.contains(r.variables, "a"))
+
+@test
+fn test_a_body_that_is_not_a_request_is_refused_with_a_reason() [io]
+    // "Bad request" about a forty-line body is not something a
+    // developer can act on.
+    test.case("not JSON at all")
+    match gqlhttp.read_post("<html>", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("JSON with no query")
+    match gqlhttp.read_post("{\"operationName\":\"Q\"}", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and variables that are not an object")
+    match gqlhttp.read_post("{\"query\":\"{me}\",\"variables\":[1]}", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_get_query_string_reads_the_same_members() [io]
+    test.case("percent-encoded")
+    match gqlhttp.read_get("query=%7B%20me%20%7D", gqlhttp.defaults())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.query, "{ me }")
+
+    test.case("with variables as JSON inside a parameter")
+    match gqlhttp.read_get("query=%7Bme%7D&variables=%7B%22a%22%3A1%7D",
+                           gqlhttp.defaults())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(str.contains(r.variables, "a"))
+
+@test
+fn test_a_repeated_query_parameter_is_seen_rather_than_answered_first() [io]
+    // form-nv sees every occurrence; `http.server.query_get` answers
+    // the first and drops the rest.
+    test.case("two query parameters")
+    match gqlhttp.read_get("query=%7Bme%7D&query=%7Byou%7D", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_get_is_refused_entirely_where_a_deployment_says_so() [io]
+    test.case("post_only")
+    test.assert(not gqlhttp.post_only().allow_get)
+
+    test.case("and GET is on by default, because a GET query is cacheable")
+    test.assert(gqlhttp.defaults().allow_get)
+
+@test
+fn test_a_mutation_over_get_is_a_mutation_a_crawler_will_perform() [io]
+    // `<img src="/graphql?query=mutation{deleteAll}">` on any page
+    // anywhere.
+    test.case("refused by default")
+    test.assert(not gqlhttp.defaults().allow_get_mutation)
+    test.assert(gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlMutation))
+
+    test.case("a query over GET is fine")
+    test.assert(not gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlQuery))
+
+    test.case("and the refusal names what to do instead")
+    test.assert_eq_str(gqlhttp.allow_header(), "POST")
+
+@test
+fn test_the_only_content_type_read_is_json() [io]
+    // `application/x-www-form-urlencoded` is a shape a CSRF form can
+    // produce, which is why a GraphQL endpoint that accepts it has a
+    // cross-site request forgery on every mutation.
+    test.case("JSON, with or without a charset")
+    test.assert(gqlhttp.reads_content_type("application/json"))
+    test.assert(gqlhttp.reads_content_type("application/json; charset=utf-8"))
+
+    test.case("the form encodings are refused")
+    test.assert(not gqlhttp.reads_content_type("application/x-www-form-urlencoded"))
+    test.assert(not gqlhttp.reads_content_type("multipart/form-data"))
+    test.assert(not gqlhttp.reads_content_type("text/plain"))
+
+    test.case("and the never-ratified application/graphql is not one either")
+    test.assert(not gqlhttp.reads_content_type("application/graphql"))
+
+@test
+fn test_the_media_type_a_client_asked_for_decides_the_status() [io]
+    // The whole of the specification's compatibility story: existing
+    // clients were written against servers that answered 200 for
+    // everything, and changing it under them would break them.
+    test.case("a client that asked for the new one gets it")
+    test.assert_eq_str(gqlhttp.negotiate("application/graphql-response+json"), modern())
+
+    test.case("and one that did not gets the legacy type")
+    test.assert_eq_str(gqlhttp.negotiate("application/json"), legacy())
+    test.assert_eq_str(gqlhttp.negotiate(""), legacy())
+    test.assert_eq_str(gqlhttp.negotiate("*/*"), legacy())
+
+@test
+fn test_a_response_with_errors_is_a_200_because_execution_began() [io]
+    // A client library that retried on 5xx would, against a server
+    // that answered 500 for a failed resolver, retry every partial
+    // success forever.
+    test.case("under both media types")
+    let r = gqlexec.with_extensions(gqlexec.empty_response(), "")
+    test.assert(gqlhttp.status_for(r, legacy()) == 200)
+    test.assert(gqlhttp.status_for(r, modern()) == 200)
+
+@test
+fn test_a_request_that_never_executed_is_a_200_or_a_400_by_media_type() [io]
+    let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
+
+    test.case("legacy: 200, because that is what old clients expect")
+    test.assert(gqlhttp.status_for_fault(f, legacy()) == 200)
+
+    test.case("and the new media type: 400")
+    test.assert(gqlhttp.status_for_fault(f, modern()) == 400)
+
+    test.case("a validation failure answers the same two")
+    let v = gqlerr.GqlValidationFailed([gqlerr.error("no such field")])
+    test.assert(gqlhttp.status_for_fault(v, legacy()) == 200)
+    test.assert(gqlhttp.status_for_fault(v, modern()) == 400)
+
+@test
+fn test_a_content_type_carries_a_charset_because_somebodys_name_has_an_accent() [io]
+    test.case("both media types")
+    test.assert(str.contains(gqlhttp.content_type(legacy()), "charset=utf-8"))
+    test.assert(str.contains(gqlhttp.content_type(modern()), "charset=utf-8"))
+
+@test
+fn test_the_headers_are_a_list_so_a_caller_does_not_decide_which() [io]
+    test.case("a plain response")
+    let r = gqlexec.empty_response()
+    test.assert(list.len(gqlhttp.response_headers(r, legacy())) >= 1)
+
+@test
+fn test_a_fault_has_a_body_in_the_media_type_negotiated() [io]
+    test.case("the errors are in it")
+    let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
+    test.assert(str.contains(gqlhttp.fault_body(f, legacy()), "errors"))
+
+@test
+fn test_a_request_from_a_form_on_another_site_cannot_carry_json() [io]
+    // A form can only send three content types and none of them is
+    // JSON; a request carrying a custom header has been through a CORS
+    // preflight.
+    test.case("no headers at all is not preflighted")
+    test.assert(not gqlhttp.looks_preflighted(no_headers))
+
+    test.case("a JSON content type is")
+    test.assert(gqlhttp.looks_preflighted(json_headers))
+
+    test.case("and the headers that count are published rather than hidden")
+    test.assert(list.len(gqlhttp.preflight_headers()) >= 3)
+
+@test
+fn test_a_persisted_query_hash_is_read_and_the_table_is_the_deployments() [io]
+    // Reading the field is four lines nobody should write twice;
+    // STORING the documents is a deployment's own business.
+    test.case("no hash in an ordinary request")
+    test.assert_eq_str(gqlhttp.persisted_hash(gqlexec.request("{ me }")), "")
+
+    test.case("and the not-found error carries the code every client retries on")
+    test.assert_eq_str(gqlerr.code_of(gqlhttp.persisted_not_found()),
+                       "PERSISTED_QUERY_NOT_FOUND")
+
+@test
+fn test_a_form_body_already_parsed_reads_the_same() [io]
+    test.case("for the caller that parsed the query for another reason")
+    match gqlhttp.read_form(formurl.parse_str("query=%7Bme%7D"), gqlhttp.defaults())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.query, "{me}")

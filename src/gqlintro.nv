@@ -1,0 +1,283 @@
+// gqlintro.nv — `__schema`, `__type` and `__typename`, answered from a
+// schema value.  `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// INTROSPECTION IS NOT A RESOLVER'S JOB, WHICH IS WHY IT IS A MODULE.
+// § 4's three meta-fields are answered entirely from the schema, and a
+// deployment that had to write resolvers for `__Type`, `__Field`,
+// `__InputValue`, `__EnumValue` and `__Directive` would be writing
+// forty functions that every deployment writes identically.  So the
+// executor answers them here, before the caller's resolver is
+// consulted at all — and a caller cannot accidentally shadow them,
+// because `gqlsdl.is_reserved_name` refuses a schema that defines one.
+//
+// AND IT IS `[]`, WHICH IS THE OTHER HALF: a schema registry, a
+// codegen tool or a linter can produce the introspection document from
+// an SDL file with nothing running.  That is what `document` is for,
+// and it is the reason a whole class of tooling does not need a server.
+//
+// TURNING INTROSPECTION OFF IS A REAL DECISION AND A BADLY ARGUED ONE.
+// It is widely recommended for production and it is not a security
+// boundary: a schema is discoverable by asking for field names one at
+// a time and reading the "did you mean" in the error, which every
+// server helpfully provides.  What disabling it actually buys is that
+// the discovery is SLOW and LOUD — thousands of failed requests
+// instead of one — which is worth something to a deployment watching
+// its logs and nothing to one that is not.  `GqlIntroPolicy` carries
+// the decision with `suggestions_off` beside it, because turning
+// introspection off and leaving the suggestions on is the combination
+// that buys nothing at all.
+
+use gqlerr
+use gqlsdl
+
+// What a deployment allows to be discovered.
+pub struct GqlIntroPolicy
+    // Whether `__schema` and `__type` answer.  True by default: an
+    // introspection query is how every client tool, editor plugin and
+    // code generator works, and a deployment turning it off should
+    // mean to.
+    enabled: Bool
+    // Whether a validation error naming an unknown field offers a
+    // suggestion.  Turning introspection off and leaving these on
+    // buys nothing: the schema is still discoverable, one field at a
+    // time, from the errors.
+    suggestions_off: Bool
+    // Whether deprecated fields and enum values are included when the
+    // query does not ask for them.  § 4.5's
+    // `includeDeprecated` argument defaults to false and this is the
+    // deployment-wide default behind it.
+    include_deprecated: Bool
+
+// Introspection on, suggestions on, deprecations hidden — which is
+// § 4's own default behaviour.
+//
+// ```novo
+// use gqlintro
+//
+// fn main() [io]
+//     println("${gqlintro.defaults().enabled}")
+// ```
+pub fn defaults() -> GqlIntroPolicy []
+    todo("graphql-nv.gqlintro.defaults")
+
+// Introspection off AND suggestions off.
+//
+// The two together, as one function, because they are only worth
+// anything together: a deployment that disabled `__schema` and left
+// the "did you mean" in its errors has a schema that is still
+// discoverable, one field at a time.
+//
+// ```novo
+// use gqlintro
+//
+// fn main() [io]
+//     let p = gqlintro.closed()
+//     println("${p.enabled} ${p.suggestions_off}")
+// ```
+pub fn closed() -> GqlIntroPolicy []
+    todo("graphql-nv.gqlintro.closed")
+
+// ── Answering the meta-fields ────────────────────────────────────────
+
+// Whether a field name is one of § 4.3's three meta-fields.
+//
+// `__typename` on any composite, `__schema` and `__type` on the query
+// root.  Published because the executor and the validator both need
+// it and would otherwise carry the list twice.
+//
+// ```novo
+// use gqlintro
+//
+// fn main() [io]
+//     println("${gqlintro.is_meta_field("__typename")}")
+// ```
+pub fn is_meta_field(name: Str) -> Bool []
+    todo("graphql-nv.gqlintro.is_meta_field")
+
+// Whether a meta-field is one the policy answers.
+//
+// `__typename` ALWAYS answers, even with introspection off: § 4.3
+// makes it available on every composite, a client uses it to decide
+// which fragment matched, and a server that suppressed it would break
+// every union query in the world for no benefit — the type name is in
+// the response already.
+//
+// ```novo
+// use gqlintro
+//
+// fn main() [io]
+//     println("${gqlintro.answers(gqlintro.closed(), "__typename")}")
+// ```
+pub fn answers(p: GqlIntroPolicy, field: Str) -> Bool []
+    todo("graphql-nv.gqlintro.answers")
+
+// The `__schema` field's value, as JSON.
+//
+// The whole introspection document, which is what a client tool
+// downloads and caches.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println(gqlintro.schema_value(s, gqlintro.defaults()))
+// ```
+pub fn schema_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy) -> Str []
+    todo("graphql-nv.gqlintro.schema_value")
+
+// The `__type(name:)` field's value, as JSON, or `None` for a type the
+// schema does not have.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqlintro.type_value(s, gqlintro.defaults(), "Query")
+//                 Some(v) => println(v)
+//                 None    => println("no such type")
+// ```
+pub fn type_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, name: Str) -> ?Str []
+    todo("graphql-nv.gqlintro.type_value")
+
+// ── The whole document ───────────────────────────────────────────────
+
+// The introspection document a full introspection query would answer,
+// as JSON.
+//
+// `[]`, and that is what makes a whole class of tooling not need a
+// server: a schema registry, a code generator or a linter produces
+// this from an SDL file with nothing running.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println(gqlintro.document(s))
+// ```
+pub fn document(s: gqlsdl.GqlSchema) -> Str []
+    todo("graphql-nv.gqlintro.document")
+
+// A schema rebuilt FROM an introspection document.
+//
+// The other direction, and the one a gateway needs: a service answers
+// its introspection query, the gateway turns it back into a schema and
+// federates it.  Also what turns a downloaded `schema.json` into SDL,
+// through `gqlsdl.print_schema`.
+//
+// Refuses a document that is not one — and names what is missing,
+// because "invalid introspection result" about a forty-thousand-line
+// document is not something anybody can act on.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlintro.schema_of("{}")
+//         Ok(s)  => println(s.query_type)
+//         Err(_) => println("not an introspection document")
+// ```
+pub fn schema_of(document_json: Str) -> Result<gqlsdl.GqlSchema, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlintro.schema_of")
+
+// The introspection query itself, as a document.
+//
+// The exact query graphql-js sends, published so a client in this
+// language sends the same one — and so a test can assert this
+// package's answer against a known document rather than one it
+// invented.
+//
+// ```novo
+// use std.str
+// use gqlintro
+//
+// fn main() [io]
+//     println("${str.len(gqlintro.introspection_query())}")
+// ```
+pub fn introspection_query() -> Str []
+    todo("graphql-nv.gqlintro.introspection_query")
+
+// ── The meta-types ───────────────────────────────────────────────────
+
+// The names § 4.5 reserves for introspection's own types:
+// `__Schema`, `__Type`, `__Field`, `__InputValue`, `__EnumValue`,
+// `__Directive`, `__TypeKind`, `__DirectiveLocation`.
+//
+// A schema may not define one, a printer must not emit one, and a
+// diff must not report them as additions.  Published so the three
+// places that need the list share it.
+//
+// ```novo
+// use std.list
+// use gqlintro
+//
+// fn main() [io]
+//     println("${list.len(gqlintro.meta_type_names())}")
+// ```
+pub fn meta_type_names() -> [Str] []
+    todo("graphql-nv.gqlintro.meta_type_names")
+
+// The `__TypeKind` spelling of a type's kind: `SCALAR`, `OBJECT`,
+// `INTERFACE`, `UNION`, `ENUM`, `INPUT_OBJECT`, `LIST`, `NON_NULL`.
+//
+// Note the last two, which are NOT `gqlsdl.GqlTypeKind` values:
+// introspection models a wrapper as a `__Type` whose `kind` is `LIST`
+// or `NON_NULL` and whose `ofType` is the thing inside.  That
+// asymmetry is § 4.5's and it is the part a hand-written introspection
+// answer gets wrong.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     println(gqlintro.type_kind_name(gqlsdl.GqlObject))
+// ```
+pub fn type_kind_name(k: gqlsdl.GqlTypeKind) -> Str []
+    todo("graphql-nv.gqlintro.type_kind_name")
+
+// The `__DirectiveLocation` values § 3.13 defines: the seven
+// executable locations and the twelve type-system ones.
+//
+// ```novo
+// use std.list
+// use gqlintro
+//
+// fn main() [io]
+//     println("${list.len(gqlintro.directive_locations())}")
+// ```
+pub fn directive_locations() -> [Str] []
+    todo("graphql-nv.gqlintro.directive_locations")
+
+// A suggestion for an unknown field name, or empty where the policy
+// says no.
+//
+// The "did you mean" a validation error carries — and the reason
+// `GqlIntroPolicy.suggestions_off` exists: a deployment that disabled
+// `__schema` and left this on has a schema that is still discoverable,
+// one field at a time, from the errors.
+//
+// ```novo
+// use gqlintro
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println(gqlintro.suggest_field(s, gqlintro.defaults(), "Query", "mee"))
+// ```
+pub fn suggest_field(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, type_name: Str,
+                     attempted: Str) -> Str []
+    todo("graphql-nv.gqlintro.suggest_field")

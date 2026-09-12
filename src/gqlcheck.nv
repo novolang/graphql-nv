@@ -1,0 +1,401 @@
+// gqlcheck.nv — § 5's validation rules, by name, against a schema.
+// `[]`.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// VALIDATION CANNOT FAIL.  `validate` answers a LIST of errors, never
+// a `Result`: a document that does not satisfy the schema is the
+// ANSWER — a 400 whose body is the list — and modelling it as an error
+// would put the ordinary case of a developer typing a field name
+// wrongly on the failure path.  Everything genuinely wrong is wrong in
+// the SCHEMA, and `gqlsdl.build` is the only call in this package that
+// answers a `Result` about one.  schema-nv and openapi-nv make the
+// same split, for the same reason, and the three compose because of it.
+//
+// EVERY RULE IS NAMED, AND THE NAMES ARE THE SPECIFICATION'S.
+// `rule_names()` answers the twenty-two § 5 rules this package
+// implements, in the specification's own spelling; `validate_only` and
+// `validate_except` take those names.  That matters for two real
+// cases: a gateway that must not apply "Fragments must be used"
+// because it splices fragments in later, and a deployment migrating a
+// client off a rule it has been violating for years.  A validator
+// whose rules are anonymous cannot be told either thing.
+//
+// AND IT MATTERS FOR REVIEW.  "This validator implements § 5" is not a
+// claim a reader can check.  A list of twenty-two names, each with a
+// test, is.
+//
+// THE ONE RULE THAT IS A SECURITY CONTROL IS § 5.5.2.2, "Fragment
+// spreads must not form cycles".  `fragment A on X { ...B }` and
+// `fragment B on X { ...A }` is a document that expands forever, and a
+// server that validated everything else and not that one has a
+// single-request denial of service.  It is in the list and it has a
+// test.
+//
+// WHAT IS OUT.  The custom-scalar half of § 5.6.1: whether `"2026-13-45"`
+// is a valid `Date` is the scalar's own question, this package does not
+// know what a `Date` is, and a validator that guessed would reject
+// values a deployment accepts.  `gqlexec.GqlResolver` is where a custom
+// scalar's coercion belongs.
+
+use gqlerr
+use gqllang
+use gqlsdl
+
+// Everything wrong with a document, against a schema.
+//
+// An empty list means valid.  Answers EVERY problem rather than the
+// first: a developer fixing six mistakes one round trip at a time is
+// six round trips, and a schema-aware editor wants them all at once.
+//
+// The order is document order, so an editor's gutter marks read top to
+// bottom.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no schema")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no document")
+//                 Ok(d)  => println("${list.len(gqlcheck.validate(s, d))}")
+// ```
+pub fn validate(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.validate")
+
+// Whether a document is valid, which is `validate` answering nothing.
+//
+// ```novo
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  => println("${gqlcheck.is_valid(s, d)}")
+// ```
+pub fn is_valid(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> Bool []
+    todo("graphql-nv.gqlcheck.is_valid")
+
+// The § 5 rules this package implements, in the specification's own
+// spelling.
+//
+// The list IS the contract.  "This validator implements § 5" is not a
+// claim a reader can check; twenty-two names each with a test is.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+//
+// fn main() [io]
+//     println("${list.len(gqlcheck.rule_names())}")
+// ```
+pub fn rule_names() -> [Str] []
+    todo("graphql-nv.gqlcheck.rule_names")
+
+// The specification section a rule comes from: `5.5.2.2`.
+//
+// For a diagnostic that a person can look up.
+//
+// ```novo
+// use gqlcheck
+//
+// fn main() [io]
+//     println(gqlcheck.rule_section("Fragment spreads must not form cycles"))
+// ```
+pub fn rule_section(rule: Str) -> Str []
+    todo("graphql-nv.gqlcheck.rule_section")
+
+// Validation with only the named rules applied.
+//
+// For a tool that wants one answer: an editor highlighting unknown
+// fields as you type does not want "Fragments must be used" firing on
+// every keystroke of a fragment being written.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  =>
+//                     let rs = ["Field selections must exist on the type"]
+//                     println("${list.len(gqlcheck.validate_only(s, d, rs))}")
+// ```
+pub fn validate_only(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
+                     rules: [Str]) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.validate_only")
+
+// Validation with the named rules skipped.
+//
+// For a gateway that splices fragments in after validation, and for a
+// deployment migrating a client off a rule it has been violating for
+// years.  Named rather than a boolean, so a deployment's configuration
+// says WHICH rule it is not applying.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  =>
+//                     let rs = ["Fragments must be used"]
+//                     println("${list.len(gqlcheck.validate_except(s, d, rs))}")
+// ```
+pub fn validate_except(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
+                       rules: [Str]) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.validate_except")
+
+// ── The rules a caller reaches for individually ──────────────────────
+//
+// Published one by one because each is a question somebody asks
+// outside a full validation: an editor, a gateway, a schema registry.
+
+// § 5.5.2.2 — whether a document's fragments spread into a cycle.
+//
+// The one validation rule that is a SECURITY CONTROL.
+// `fragment A on X { ...B }` with `fragment B on X { ...A }` is a
+// document that expands forever, and a server that validated
+// everything else and not this one has a denial of service that costs
+// a client one request.
+//
+// Answers the cycle it found, as the fragment names in order, so a
+// diagnostic can show it — `A → B → A` is a sentence a developer can
+// act on where "cyclic fragment" is not.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+//
+// fn main() [io]
+//     match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//         Err(_) => println("no")
+//         Ok(d)  => println("${list.len(gqlcheck.fragment_cycle(d))}")
+// ```
+pub fn fragment_cycle(d: gqllang.GqlDocument) -> [Str] []
+    todo("graphql-nv.gqlcheck.fragment_cycle")
+
+// § 5.3.2 — whether two selections that share a response key can be
+// merged.
+//
+// The rule with the most implementation behind it and the least
+// visibility: `{ a: name b: name }` is fine, `{ a: name a: email }` is
+// not, and `{ user { name } user { email } }` is fine because those
+// merge.  A server that skipped it produces a response whose shape
+// depends on field order.
+//
+// Answers every conflict, as `key: reason` sentences.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  => println("${list.len(gqlcheck.merge_conflicts(s, d))}")
+// ```
+pub fn merge_conflicts(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.merge_conflicts")
+
+// § 5.8.3 and § 5.8.4 — whether every variable a document uses is
+// declared, and every variable it declares is used.
+//
+// Both directions, because they catch opposite mistakes: an undeclared
+// variable is a query that cannot run, and an unused one is usually a
+// field somebody deleted and a parameter they did not.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  => println("${list.len(gqlcheck.variable_problems(s, d))}")
+// ```
+pub fn variable_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.variable_problems")
+
+// § 5.5.2.3 — whether a fragment's type condition can ever apply where
+// it is spread.
+//
+// `... on Dog` inside a `Cat` selection is a fragment that can never
+// match, which is almost always a copied-and-edited query somebody
+// half-edited.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  => println("${list.len(gqlcheck.impossible_fragments(s, d))}")
+// ```
+pub fn impossible_fragments(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.impossible_fragments")
+
+// ── Variables ────────────────────────────────────────────────────────
+
+// § 6.1.2 — the variable values, coerced against their declared types.
+//
+// Run BEFORE execution begins, which is what makes a bad variable a
+// request error with no `data` member rather than a field error with
+// one.  Answers every bad variable and not the first.
+//
+// The values arrive as the standard library's JSON, because that is
+// what a request body carries.
+//
+// ```novo
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  =>
+//                     match gqllang.operation_of(d, "")
+//                         Err(_) => println("no")
+//                         Ok(op) =>
+//                             match gqlcheck.coerce_variables(s, op, "{}")
+//                                 Ok(_)  => println("coerced")
+//                                 Err(_) => println("a variable does not fit")
+// ```
+pub fn coerce_variables(s: gqlsdl.GqlSchema, op: gqllang.GqlOperation,
+                        variables_json: Str) -> Result<Str, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlcheck.coerce_variables")
+
+// Whether a JSON value fits a declared GraphQL type.
+//
+// The single-value half of `coerce_variables`, published because a
+// caller building variables programmatically wants to check one before
+// it sends forty.
+//
+// Carries § 3.5.5's `ID` rule, which surprises everybody: an `ID`
+// accepts a STRING or an INTEGER on input and is always serialised as
+// a string on output.  A checker that required a string rejects half
+// the clients in the world.
+//
+// ```novo
+// use gqlcheck
+// use gqlsdl
+// use gqllang
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_type("ID!")
+//                 None    => println("no")
+//                 Some(t) => println("${gqlcheck.value_fits(s, "42", t)}")
+// ```
+pub fn value_fits(s: gqlsdl.GqlSchema, value_json: Str, t: gqllang.GqlTypeRef) -> Bool []
+    todo("graphql-nv.gqlcheck.value_fits")
+
+// ── Directives ───────────────────────────────────────────────────────
+
+// Whether a selection is included, given `@skip` and `@include` and
+// the coerced variables (§ 3.13.1, § 3.13.2).
+//
+// Both directives in one function, because § 3.13's note is that when
+// BOTH are present the field is included only if `@skip(if: false)`
+// AND `@include(if: true)` — and a caller that evaluated them
+// separately would apply whichever it checked last.
+//
+// ```novo
+// use gqlcheck
+// use gqllang
+//
+// fn main() [io]
+//     println("${gqlcheck.selection_included(gqllang.field_selection("me"), "{}")}")
+// ```
+pub fn selection_included(sel: gqllang.GqlSelection, variables_json: Str) -> Bool []
+    todo("graphql-nv.gqlcheck.selection_included")
+
+// § 5.7.1 and § 5.7.2 — whether every directive in a document is
+// defined and in a location it may appear.
+//
+// Includes the 2021 repeatability rule: a directive that is not
+// `repeatable` may appear once per location, and a document that
+// repeats one is invalid rather than having the last one win.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+// use gqllang
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqllang.parse_executable("{ me }", gqllang.default_limits())
+//                 Err(_) => println("no")
+//                 Ok(d)  => println("${list.len(gqlcheck.directive_problems(s, d))}")
+// ```
+pub fn directive_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
+    todo("graphql-nv.gqlcheck.directive_problems")
+
+// ── What is deliberately not checked ─────────────────────────────────
+
+// The § 5 rules this package does NOT implement, with a reason each.
+//
+// Published as a list rather than left to a README, so a deployment
+// auditing its GraphQL layer reads it from the code.  The custom-scalar
+// half of § 5.6.1 is the entry that matters: whether `"2026-13-45"` is
+// a valid `Date` is the scalar's own question, this package does not
+// know what a `Date` is, and a validator that guessed would reject
+// values a deployment accepts.
+//
+// ```novo
+// use std.list
+// use gqlcheck
+//
+// fn main() [io]
+//     println("${list.len(gqlcheck.unchecked_rules())}")
+// ```
+pub fn unchecked_rules() -> [Str] []
+    todo("graphql-nv.gqlcheck.unchecked_rules")

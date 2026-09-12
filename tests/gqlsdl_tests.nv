@@ -1,0 +1,331 @@
+// gqlsdl_tests.nv — the schema language, and the schemas that cannot
+// exist.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqlsdl.<fn>`.
+//
+// `parse` IS SYNTAX AND `build` IS THE OTHER HALF.  A field whose type
+// is not defined, a type claiming an interface it does not satisfy,
+// two definitions with one name, a schema with no `Query` — none of
+// those is a syntax error and all of them make a schema that cannot
+// exist.  The two answer separately because a diagnostic that said
+// "invalid schema" for both would be useless for either.
+
+use std.test
+use std.list
+use std.str
+use gqlsdl
+
+fn built(src: Str) -> ?gqlsdl.GqlSchema
+    match gqlsdl.build(src)
+        Ok(s)  => Some(s)
+        Err(_) => None
+
+fn a_pet_schema() -> Str
+    "interface Node { id: ID! }\n"
+        + "interface Pet implements Node { id: ID! name: String! }\n"
+        + "type Dog implements Pet & Node { id: ID! name: String! barks: Boolean }\n"
+        + "type Cat implements Pet & Node { id: ID! name: String! purrs: Boolean }\n"
+        + "union Animal = Dog | Cat\n"
+        + "enum Size { SMALL LARGE }\n"
+        + "input PetFilter { size: Size }\n"
+        + "type Query { pets(filter: PetFilter): [Pet!]! animal: Animal }\n"
+
+@test
+fn test_the_six_kinds_of_type_definition_parse() [io]
+    test.case("scalar, enum, object, interface, union, input object")
+    match gqlsdl.parse(a_pet_schema())
+        Err(_) => test.assert(false)
+        Ok(ts) => test.assert(list.len(ts) == 8)
+
+@test
+fn test_syntax_and_resolution_fail_separately() [io]
+    test.case("a syntax error")
+    match gqlsdl.parse("type Query {")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a field whose type is not defined parses and does not build")
+    match gqlsdl.parse("type Query { me: NoSuchType }")
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+    test.assert_none(built("type Query { me: NoSuchType }"))
+
+@test
+fn test_a_schema_with_no_query_type_is_not_a_schema() [io]
+    // § 3.3.  A schema whose only root is a mutation cannot answer a
+    // read, and there is no such GraphQL service.
+    test.case("refused")
+    test.assert_none(built("type Mutation { sign_out: Boolean }"))
+
+    test.case("and one with a Query is built")
+    match built("type Query { me: String }")
+        None    => test.assert(false)
+        Some(s) => test.assert_eq_str(s.query_type, "Query")
+
+@test
+fn test_two_definitions_with_one_name_are_refused() [io]
+    test.case("two objects")
+    test.assert_none(built("type Query { me: String } type Query { you: String }"))
+
+    test.case("and a type that redefines a built-in scalar")
+    test.assert_none(built("scalar String type Query { me: String }"))
+
+@test
+fn test_an_object_that_does_not_satisfy_its_interface_is_refused() [io]
+    test.case("a missing field")
+    test.assert_none(built("interface Named { name: String! }\n"
+        + "type Query implements Named { me: String }"))
+
+    test.case("and the pet schema, which does satisfy everything, builds")
+    test.assert_some(built(a_pet_schema()))
+
+@test
+fn test_an_interface_may_implement_an_interface_which_is_the_2021_addition() [io]
+    // § 3.7, added after June 2018.  It turns interface conformance
+    // from one check into a transitive one: `Dog implements Pet` must
+    // also satisfy everything `Pet implements Node` requires.
+    test.case("the transitive case builds")
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            match gqlsdl.type_named(s, "Pet")
+                None    => test.assert(false)
+                Some(t) => test.assert(list.len(t.interfaces) == 1)
+
+    test.case("and a type implementing the child without the parent is refused")
+    test.assert_none(built("interface Node { id: ID! }\n"
+        + "interface Pet implements Node { id: ID! }\n"
+        + "type Dog implements Pet { id: ID! }\n"
+        + "type Query { dog: Dog }"))
+
+@test
+fn test_input_and_output_types_are_disjoint() [io]
+    // § 3.10.  A schema that used one type for an argument and a field
+    // is a schema that cannot exist.
+    test.case("an input object as a field's type is refused")
+    test.assert_none(built("input F { a: String } type Query { f: F }"))
+
+    test.case("an object as an argument's type is refused")
+    test.assert_none(built("type U { a: String } type Query { f(u: U): String }"))
+
+    test.case("and the predicates say which is which")
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.assert(gqlsdl.is_input_type(s, "PetFilter"))
+            test.assert(not gqlsdl.is_output_type(s, "PetFilter"))
+            test.assert(gqlsdl.is_output_type(s, "Dog"))
+            test.assert(not gqlsdl.is_input_type(s, "Dog"))
+
+    test.case("a scalar and an enum are BOTH")
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.assert(gqlsdl.is_input_type(s, "Size"))
+            test.assert(gqlsdl.is_output_type(s, "Size"))
+
+@test
+fn test_a_composite_needs_a_selection_set_and_a_leaf_refuses_one() [io]
+    // § 5.3.3's two rules, and the two most common mistakes in a
+    // hand-written query.
+    test.case("objects, interfaces and unions are composite")
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.assert(gqlsdl.is_composite(s, "Dog"))
+            test.assert(gqlsdl.is_composite(s, "Pet"))
+            test.assert(gqlsdl.is_composite(s, "Animal"))
+
+    test.case("and scalars and enums are not")
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.assert(not gqlsdl.is_composite(s, "String"))
+            test.assert(not gqlsdl.is_composite(s, "Size"))
+
+@test
+fn test_possible_types_is_computed_once_because_two_places_need_it_to_agree() [io]
+    // § 5.5.2.3's fragment applicability and § 6.4.3's field ordering
+    // both rest on it, and computing it separately in the validator
+    // and the executor is how the two come to disagree.
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("an object is itself")
+            test.assert(list.len(gqlsdl.possible_types(s, "Dog")) == 1)
+
+            test.case("an interface is every implementor")
+            test.assert(list.len(gqlsdl.possible_types(s, "Pet")) == 2)
+
+            test.case("a union is every member")
+            test.assert(list.len(gqlsdl.possible_types(s, "Animal")) == 2)
+
+            test.case("and a scalar is nothing")
+            test.assert(list.len(gqlsdl.possible_types(s, "String")) == 0)
+
+@test
+fn test_subtyping_walks_the_transitive_interface_chain() [io]
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("a type is its own subtype")
+            test.assert(gqlsdl.is_subtype(s, "Dog", "Dog"))
+
+            test.case("an implementor is a subtype of its interface")
+            test.assert(gqlsdl.is_subtype(s, "Dog", "Pet"))
+
+            test.case("and transitively of ITS interface")
+            test.assert(gqlsdl.is_subtype(s, "Dog", "Node"))
+
+            test.case("a member is a subtype of its union")
+            test.assert(gqlsdl.is_subtype(s, "Dog", "Animal"))
+
+            test.case("and two siblings are not subtypes of each other")
+            test.assert(not gqlsdl.is_subtype(s, "Dog", "Cat"))
+
+@test
+fn test_a_field_and_an_argument_are_findable_by_name() [io]
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("a field")
+            match gqlsdl.field_named(s, "Query", "pets")
+                None    => test.assert(false)
+                Some(f) => test.assert_eq_str(f.name, "pets")
+
+            test.case("its argument")
+            match gqlsdl.arg_named(s, "Query", "pets", "filter")
+                None    => test.assert(false)
+                Some(a) => test.assert_eq_str(a.type_ref.name, "PetFilter")
+
+            test.case("and a field that is not there")
+            test.assert_none(gqlsdl.field_named(s, "Query", "nope"))
+
+@test
+fn test_the_meta_fields_answer_from_field_named_so_nobody_special_cases_them() [io]
+    // A caller that special-cased them would special-case them
+    // differently in the validator and the executor.
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("__typename on any composite")
+            test.assert_some(gqlsdl.field_named(s, "Dog", "__typename"))
+
+            test.case("__schema and __type on the query root")
+            test.assert_some(gqlsdl.field_named(s, "Query", "__schema"))
+            test.assert_some(gqlsdl.field_named(s, "Query", "__type"))
+
+            test.case("and __schema NOT on anything else")
+            test.assert_none(gqlsdl.field_named(s, "Dog", "__schema"))
+
+@test
+fn test_the_reserved_names_are_published_once() [io]
+    test.case("two leading underscores")
+    test.assert(gqlsdl.is_reserved_name("__Type"))
+    test.assert(not gqlsdl.is_reserved_name("_Type"))
+    test.assert(not gqlsdl.is_reserved_name("Type"))
+
+    test.case("a schema may not define one")
+    test.assert_none(built("type __Secret { a: String } type Query { me: String }"))
+
+    test.case("the five built-in scalars")
+    test.assert(list.len(gqlsdl.builtin_scalars()) == 5)
+
+    test.case("and the four built-in directives, which the 2021 spec made four")
+    test.assert(list.len(gqlsdl.builtin_directives()) == 4)
+
+@test
+fn test_a_schema_prints_in_a_stable_order_so_a_diff_is_a_diff() [io]
+    // A diff over SOURCE order reports a move as a change, which makes
+    // a schema registry's report useless.
+    test.case("the same schema written twice prints the same")
+    let a = "type Query { me: String } type User { name: String }"
+    let b = "type User { name: String } type Query { me: String }"
+    match built(a)
+        None    => test.assert(false)
+        Some(x) =>
+            match built(b)
+                None    => test.assert(false)
+                Some(y) => test.assert_eq_str(gqlsdl.print_schema(x),
+                                              gqlsdl.print_schema(y))
+
+@test
+fn test_a_schema_can_be_assembled_from_definitions_a_caller_parsed() [io]
+    // For a gateway stitching several documents, and for a tool that
+    // generated its types.
+    test.case("build_from")
+    match gqlsdl.parse("type Query { me: String }")
+        Err(_) => test.assert(false)
+        Ok(ts) =>
+            match gqlsdl.build_from(ts, [], "Query", "", "")
+                Err(_) => test.assert(false)
+                Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+@test
+fn test_deprecations_include_enum_values_which_is_the_half_that_gets_missed() [io]
+    test.case("a deprecated field and a deprecated enum value")
+    let src = "enum Size { SMALL LARGE @deprecated(reason: \"use HUGE\") HUGE }\n"
+        + "type Query { me: String @deprecated(reason: \"use viewer\") viewer: String }"
+    match built(src)
+        None    => test.assert(false)
+        Some(s) => test.assert(list.len(gqlsdl.deprecations(s)) == 2)
+
+@test
+fn test_breaking_changes_are_asymmetric_and_the_direction_is_graphqls() [io]
+    // In GraphQL the CLIENT chooses the fields, so removing from an
+    // output type breaks clients and adding does not; and the client
+    // supplies the arguments, so adding a REQUIRED argument breaks
+    // clients and removing one does not.
+    let before = "type Query { me: String you: String }"
+
+    test.case("a schema against itself breaks nothing")
+    match built(before)
+        None    => test.assert(false)
+        Some(a) => test.assert(list.len(gqlsdl.breaking_changes(a, a)) == 0)
+
+    test.case("removing a field breaks clients")
+    match built(before)
+        None    => test.assert(false)
+        Some(a) =>
+            match built("type Query { me: String }")
+                None    => test.assert(false)
+                Some(b) => test.assert(list.len(gqlsdl.breaking_changes(a, b)) == 1)
+
+    test.case("adding one does not")
+    match built(before)
+        None    => test.assert(false)
+        Some(a) =>
+            match built("type Query { me: String you: String them: String }")
+                None    => test.assert(false)
+                Some(b) => test.assert(list.len(gqlsdl.breaking_changes(a, b)) == 0)
+
+    test.case("and adding a REQUIRED argument does")
+    match built(before)
+        None    => test.assert(false)
+        Some(a) =>
+            match built("type Query { me(id: ID!): String you: String }")
+                None    => test.assert(false)
+                Some(b) => test.assert(list.len(gqlsdl.breaking_changes(a, b)) == 1)
+
+@test
+fn test_specified_by_is_the_only_machine_readable_meaning_a_custom_scalar_has() [io]
+    // § 3.5.7, added by the 2021 specification.
+    test.case("a scalar with a specification URL")
+    let src = "scalar Date @specifiedBy(url: \"https://scalars.graphql.org/date\")\n"
+        + "type Query { today: Date }"
+    match built(src)
+        None    => test.assert(false)
+        Some(s) =>
+            match gqlsdl.type_named(s, "Date")
+                None    => test.assert(false)
+                Some(t) => test.assert(str.contains(t.specified_by, "scalars.graphql.org"))
+
+@test
+fn test_an_executable_definition_in_an_sdl_document_is_refused() [io]
+    // A schema file carrying `query { me }` is a configuration file
+    // with a request in it.
+    test.case("refused by name")
+    match gqlsdl.parse("query { me }")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

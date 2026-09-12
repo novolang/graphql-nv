@@ -1,0 +1,321 @@
+// gqllang_tests.nv — the query language, and the bounds a document
+// crosses.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: graphql-nv.gqllang.<fn>`.
+//
+// THE LIMIT TESTS ARE THE ONES THAT MATTER.  A query language that
+// lets a client send a document of arbitrary depth is a denial of
+// service with a schema attached, and the two shapes below —
+// `{a{a{a{…}}}}` and `{a:me b:me c:me …}` — are the two a bound has to
+// see.  The second is the one a depth limit misses.
+
+use std.test
+use std.list
+use std.str
+use gqllang
+
+fn a_document(src: Str) -> ?gqllang.GqlDocument
+    match gqllang.parse_executable(src, gqllang.default_limits())
+        Ok(d)  => Some(d)
+        Err(_) => None
+
+@test
+fn test_a_bare_selection_set_is_an_anonymous_query() [io]
+    test.case("the shorthand § 2.3 defines")
+    match a_document("{ me { name } }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(d.operations) == 1)
+            match gqllang.operation_of(d, "")
+                Err(_) => test.assert(false)
+                Ok(op) =>
+                    test.assert_eq_str(op.name, "")
+                    match op.kind
+                        GqlQuery        => test.assert(true)
+                        GqlMutation     => test.assert(false)
+                        GqlSubscription => test.assert(false)
+
+@test
+fn test_the_three_operation_kinds_parse() [io]
+    test.case("query, mutation, subscription")
+    test.assert_some(a_document("query Q { me }"))
+    test.assert_some(a_document("mutation M { sign_out }"))
+    test.assert_some(a_document("subscription S { ticks }"))
+
+@test
+fn test_a_type_system_definition_in_a_query_document_is_refused_by_name() [io]
+    // A query document carrying `type User { … }` is a client trying
+    // to change the schema.  A parser that quietly dropped it would
+    // give a deployment no way to notice.
+    test.case("a type definition")
+    test.assert_none(a_document("type User { name: String }"))
+
+    test.case("a schema definition")
+    test.assert_none(a_document("schema { query: Query }"))
+
+    test.case("and an extension")
+    test.assert_none(a_document("extend type User { age: Int }"))
+
+@test
+fn test_a_document_with_several_operations_and_no_name_is_refused() [io]
+    // § 6.1's refusal, and not a guess at the first: two operations
+    // and no `operationName` is a request whose meaning nobody knows.
+    test.case("two operations")
+    match a_document("query A { me } query B { me }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "")
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+    test.case("and naming one picks it")
+    match a_document("query A { me } query B { me }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "B")
+                Err(_) => test.assert(false)
+                Ok(op) => test.assert_eq_str(op.name, "B")
+
+    test.case("a name that is not there is a refusal and not a fallback")
+    match a_document("query A { me }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "C")
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+@test
+fn test_a_fragment_is_findable_by_name() [io]
+    test.case("defined and spread")
+    match a_document("{ me { ...Bits } } fragment Bits on User { name }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(list.len(d.fragments) == 1)
+            match gqllang.fragment_of(d, "Bits")
+                Some(f) => test.assert_eq_str(f.type_condition, "User")
+                None    => test.assert(false)
+
+    test.case("and one that is not there is None")
+    match a_document("{ me }")
+        None    => test.assert(false)
+        Some(d) => test.assert_none(gqllang.fragment_of(d, "Nope"))
+
+@test
+fn test_the_response_key_is_the_alias_where_there_is_one() [io]
+    // The key § 6.3.2's field collection groups by, and the key the
+    // response object uses.  A caller reading `.name` for it is the
+    // bug that makes aliased fields disappear.
+    test.case("with an alias")
+    match a_document("{ viewer: me }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "")
+                Err(_) => test.assert(false)
+                Ok(op) =>
+                    let sel = list.get(op.selections, 0, gqllang.field_selection("x"))
+                    test.assert_eq_str(sel.name, "me")
+                    test.assert_eq_str(gqllang.response_key(sel), "viewer")
+
+    test.case("and without one it is the name")
+    test.assert_eq_str(gqllang.response_key(gqllang.field_selection("me")), "me")
+
+@test
+fn test_a_depth_limit_is_checked_as_the_parse_descends() [io]
+    // `{a{a{a{a{…}}}}}` costs the server its stack before any
+    // validation rule has run, so the bound is at the parse and not
+    // after it.
+    test.case("the default bound")
+    test.assert(gqllang.default_limits().max_depth == 15)
+
+    test.case("a document past it is refused")
+    var deep = "{ a"
+    for _ in 0..40
+        deep = deep + " { a"
+    for _ in 0..41
+        deep = deep + " }"
+    test.assert_none(a_document(deep))
+
+    test.case("and a shallow one is not")
+    test.assert_some(a_document("{ a { b { c } } }"))
+
+@test
+fn test_aliases_have_their_own_bound_because_a_depth_limit_misses_them() [io]
+    // `{a:me b:me c:me …}` is one field resolved a thousand times from
+    // a document a thousand characters long, and it is one level deep.
+    test.case("an alias-heavy document is measurable")
+    match a_document("{ a: me b: me c: me }")
+        None    => test.assert(false)
+        Some(d) => test.assert(gqllang.alias_count(d) == 3)
+
+    test.case("and there is a bound of its own")
+    test.assert(gqllang.default_limits().max_aliases > 0)
+
+@test
+fn test_the_other_three_bounds_are_numbers() [io]
+    test.case("breadth, bytes, spreads")
+    let l = gqllang.default_limits()
+    test.assert(l.max_breadth > 0)
+    test.assert(l.max_bytes > 0)
+    test.assert(l.max_spreads > 0)
+
+    test.case("a caller can set its own")
+    test.assert(gqllang.limits(10, 50, 16384, 100, 50).max_bytes == 16384)
+
+    test.case("and a trusted document can lift them, named rather than by five zeroes")
+    let n = gqllang.no_limits()
+    test.assert(n.max_depth == 0)
+    test.assert(n.max_aliases == 0)
+
+@test
+fn test_the_measurements_are_published_so_a_bound_is_chosen_rather_than_guessed() [io]
+    test.case("depth")
+    match a_document("{ a { b { c } } }")
+        None    => test.assert(false)
+        Some(d) => test.assert(gqllang.depth_of(d) == 3)
+
+    test.case("and the field count, fragments expanded")
+    match a_document("{ me { name email } }")
+        None    => test.assert(false)
+        Some(d) => test.assert(gqllang.field_count(d) == 3)
+
+@test
+fn test_a_type_reference_keeps_nullability_per_level() [io]
+    // A type that modelled only the outer one answers wrongly for
+    // `[User!]`, where a null ELEMENT is an error and a null LIST is
+    // not.
+    test.case("a plain named type")
+    match gqllang.parse_type("String")
+        None    => test.assert(false)
+        Some(t) =>
+            test.assert_eq_str(t.name, "String")
+            test.assert(t.list_depth == 0)
+            test.assert(not gqllang.is_non_null(t))
+            test.assert(not gqllang.is_list(t))
+
+    test.case("a non-null list of non-null elements")
+    match gqllang.parse_type("[User!]!")
+        None    => test.assert(false)
+        Some(t) =>
+            test.assert(t.list_depth == 1)
+            test.assert(gqllang.is_list(t))
+            test.assert(gqllang.is_non_null(t))
+            test.assert(list.len(t.non_null) == 2)
+
+    test.case("a NULLABLE list of non-null elements — the case two booleans lose")
+    match gqllang.parse_type("[User!]")
+        None    => test.assert(false)
+        Some(t) => test.assert(not gqllang.is_non_null(t))
+
+    test.case("and a nested list")
+    match gqllang.parse_type("[[User]]")
+        None    => test.assert(false)
+        Some(t) => test.assert(t.list_depth == 2)
+
+@test
+fn test_a_type_unwraps_one_level_at_a_time() [io]
+    // How an executor walks a type while it walks a value.
+    test.case("[User!]! becomes [User!] becomes User! becomes User")
+    match gqllang.parse_type("[User!]!")
+        None    => test.assert(false)
+        Some(t) =>
+            let a = gqllang.inner_type(t)
+            test.assert_eq_str(gqllang.print_type(a), "[User!]")
+            let b = gqllang.inner_type(a)
+            test.assert_eq_str(gqllang.print_type(b), "User!")
+            test.assert_eq_str(gqllang.print_type(gqllang.inner_type(b)), "User")
+
+@test
+fn test_a_type_round_trips_through_its_written_form() [io]
+    test.case("four shapes")
+    test.assert_eq_str(gqllang.print_type(gqllang.named_type("String")), "String")
+    match gqllang.parse_type("[[User!]!]!")
+        None    => test.assert(false)
+        Some(t) => test.assert_eq_str(gqllang.print_type(t), "[[User!]!]!")
+
+@test
+fn test_a_value_is_kept_as_written_because_coercing_needs_the_schema() [io]
+    // `1` is an Int, a Float, an ID or a custom scalar depending on
+    // where it appears, and a parser that guessed would have to be
+    // corrected by the validator anyway.
+    test.case("the nine kinds are the specification's own names")
+    match gqllang.parse_value("42")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(v.kind, "int")
+
+    match gqllang.parse_value("[1, 2, 3]")
+        None    => test.assert(false)
+        Some(v) =>
+            test.assert_eq_str(v.kind, "list")
+            test.assert(list.len(v.items) == 3)
+
+    match gqllang.parse_value("{a: 1, b: 2}")
+        None    => test.assert(false)
+        Some(v) =>
+            test.assert_eq_str(v.kind, "object")
+            test.assert(list.len(v.names) == 2)
+
+    test.case("and a variable reference is a kind rather than a special case")
+    match gqllang.parse_value("\$id")
+        None    => test.assert(false)
+        Some(v) =>
+            test.assert_eq_str(v.kind, "variable")
+            test.assert_eq_str(v.text, "id")
+
+@test
+fn test_the_null_literal_is_not_the_same_as_an_absent_argument() [io]
+    // § 2.9.6: `field(x: null)` explicitly passes null and `field`
+    // does not pass `x` at all — and a default value applies to the
+    // second and not the first.
+    test.case("the literal is a value node")
+    test.assert_eq_str(gqllang.null_value().kind, "null")
+
+    test.case("and it parses as one")
+    match gqllang.parse_value("null")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(v.kind, "null")
+
+@test
+fn test_a_value_round_trips_through_its_written_form() [io]
+    test.case("printed back")
+    match gqllang.parse_value("[1, 2]")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(gqllang.print_value(v), "[1, 2]")
+
+@test
+fn test_printing_a_document_normalises_it_which_is_what_a_persisted_query_hashes() [io]
+    // Two clients that wrote the same query with different whitespace
+    // get the same hash.
+    test.case("whitespace does not survive")
+    match a_document("{me{name}}")
+        None    => test.assert(false)
+        Some(a) =>
+            match a_document("{\n  me {\n    name\n  }\n}")
+                None    => test.assert(false)
+                Some(b) => test.assert_eq_str(gqllang.print_document(a),
+                                              gqllang.print_document(b))
+
+@test
+fn test_a_selection_set_prints_on_its_own_for_a_diagnostic() [io]
+    test.case("just the selections")
+    match a_document("{ me { name } }")
+        None    => test.assert(false)
+        Some(d) =>
+            match gqllang.operation_of(d, "")
+                Err(_) => test.assert(false)
+                Ok(op) => test.assert(str.len(gqllang.print_selections(op.selections)) > 0)
+
+@test
+fn test_a_syntax_error_names_a_line_and_a_column() [io]
+    // One-based, and counted in characters — a column measured in
+    // bytes points into the middle of a name as soon as somebody uses
+    // one.
+    test.case("the fault carries both")
+    match gqllang.parse_executable("{ me", gqllang.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                GqlSyntaxError(msg, line, col) =>
+                    test.assert(line >= 1)
+                    test.assert(col >= 1)
+                _                              => test.assert(false)

@@ -1,0 +1,67 @@
+[package]
+name        = "graphql-nv"
+version     = "0.0.1"
+description = "GraphQL (October 2021): the schema language and the query language as effect-free modules, validation with the specification's rules named, and an executor whose resolver trait carries an effect parameter — so a server's declared row is what its resolvers actually do.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, from the plan's row — and the split inside it is the thing to
+# read before depending on this.
+#
+# FIVE OF THE SEVEN MODULES ARE `[]` THROUGHOUT.  `gqlerr`, `gqllang`,
+# `gqlsdl`, `gqlcheck` and `gqlintro` are the LANGUAGE: a lexer, two
+# parsers, the validator, and introspection answered from a schema
+# value.  Bytes in, values out, and not one socket — which is what
+# makes the specification's validation rules a table of documents in a
+# test rather than a server somebody has to start.
+#
+# `gqlexec` and `gqlhttp` are the half that runs a query, and `gqlexec`
+# performs nothing ITSELF: its cost is the caller's resolver's, carried
+# through `GqlResolver[e]`'s effect parameter.  `gqlhttp` is likewise
+# `[]` — it reads a request body into a `GqlRequest` and writes a
+# `GqlResponse` back out, and the socket belongs to the caller's
+# server.
+#
+# So the package's own performed row is EMPTY, and the layer is `host`
+# because that is the plan's row and because an executor whose whole
+# purpose is to call effectful resolvers has no business claiming
+# `core`.  See the README's "Does the language half earn its own row":
+# the answer is yes, and `graphql-core-nv` is named there as a row the
+# grid is missing.
+layer       = "host"
+
+category    = "web"
+
+tags        = ["graphql", "schema", "resolvers", "sdl", "async-graphql", "strawberry", "api", "query-language"]
+repository  = "https://github.com/novolang/graphql-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "One resolver trait with an effect parameter, and why it is not a table of functions"
+
+[dependencies]
+# form-nv, for one thing: the GET transport's query string.  The
+# GraphQL over HTTP specification puts `query`, `operationName`,
+# `variables` and `extensions` in a URL query for a GET, and
+# `formurl.parse_str` is what reads it — including the case that
+# matters, a request carrying TWO `query` parameters, which
+# `http.server.query_get` answers the first of and drops the rest.
+#
+# NOT serde-nv: the executor answers the standard library's own
+# `JsonValueH`, which is what a caller's server already writes.
+# NOT http-codec-nv: this package reads a body a server handed it and
+# never a request line.
+# NOT websocket-nv: subscriptions are a named gap — see `gqlexec` — and
+# depending on a WebSocket client to NOT implement them would be a
+# dependency every query-only deployment paid for.
+form-nv     = "^0.0.1"

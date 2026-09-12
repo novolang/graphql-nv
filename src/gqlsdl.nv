@@ -1,0 +1,460 @@
+// gqlsdl.nv — the schema definition language, parsed into a typed
+// schema.  `[]` throughout.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SCHEMA IS A VALUE, AND THAT IS WHY THIS PACKAGE HAS NO MACRO.
+// async-graphql derives a schema from Rust types with `#[Object]`;
+// strawberry derives one from Python classes with decorators.  Neither
+// shape is available here: `@derive` is reserved and refused, and
+// novo-lang's implicit `Serialize` is a run-time walk over a VALUE, so
+// a library sees the names and kinds one sample happened to have and
+// never the optionality, the unvisited variants, the doc comments or
+// the constraints — which is exactly what a GraphQL schema is made of.
+// openapi-nv reached the same conclusion about the same mechanism.
+//
+// So a schema is written, in SDL, and read by `parse`.  That is not a
+// consolation prize: the schema file is the artefact a front-end team
+// reviews, a gateway federates, and a codegen tool reads — and a
+// schema derived from server types is one nobody outside the server
+// can see until it is running.
+//
+// `build` IS SEPARATE FROM `parse` AND ANSWERS A `Result`.  Parsing is
+// syntax; building is the half that finds a field whose type is not
+// defined, a type that claims an interface it does not satisfy, two
+// types with one name, and a schema with no `Query` type at all.  Both
+// steps can fail and they fail about different things, so a diagnostic
+// that said "invalid schema" for both would be useless for either.
+//
+// EVERY REFUSAL NAMES EVERY PROBLEM.  A schema with six undefined
+// types reports six, because a person fixing them one build at a time
+// is six builds.
+
+use gqlerr
+use gqllang
+
+// What kind of type a definition is (§ 3.4).
+pub enum GqlTypeKind
+    // A leaf: `String`, `Int`, `Float`, `Boolean`, `ID`, or a custom
+    // one.
+    GqlScalar
+    // An enumeration.
+    GqlEnum
+    // A composite with fields.
+    GqlObject
+    // An abstract type with fields, which objects implement.
+    GqlInterface
+    // A choice of object types, with no fields of its own.
+    GqlUnion
+    // The type of an argument or a variable whose shape is a record.
+    // Distinct from an object BECAUSE it is: § 3.10 makes input and
+    // output types disjoint, and a schema that used one type for both
+    // is a schema that cannot exist.
+    GqlInputObject
+
+// A field of an object or an interface (§ 3.6).
+pub struct GqlFieldDef
+    name: Str
+    description: Str
+    args: [GqlArgDef]
+    type_ref: gqllang.GqlTypeRef
+    // The `@deprecated` reason, empty where the field is not
+    // deprecated.  Note that a field can be deprecated AND required,
+    // which is a state a schema tool has to be able to see.
+    deprecated: Str
+    directives: [gqllang.GqlDirectiveNode]
+
+// An argument of a field, or a field of an input object (§ 3.6.1,
+// § 3.10).
+pub struct GqlArgDef
+    name: Str
+    description: Str
+    type_ref: gqllang.GqlTypeRef
+    // The default, or `None`.  The difference between `None` and a
+    // default of the null LITERAL is § 2.9.6's, and it decides whether
+    // an omitted argument gets the default or gets null.
+    default_value: ?gqllang.GqlValueNode
+    deprecated: Str
+    directives: [gqllang.GqlDirectiveNode]
+
+// One value of an enum (§ 3.9).
+pub struct GqlEnumValueDef
+    name: Str
+    description: Str
+    deprecated: Str
+    directives: [gqllang.GqlDirectiveNode]
+
+// A type definition.
+//
+// One struct with a kind rather than six variants, because a schema
+// walker branches on the kind once and reads the fields that apply —
+// and because `__Type` in introspection is exactly this shape, with
+// every member nullable for the kinds it does not apply to.
+pub struct GqlTypeDef
+    kind: GqlTypeKind
+    name: Str
+    description: Str
+    // For an object and an interface.
+    fields: [GqlFieldDef]
+    // For an input object.
+    input_fields: [GqlArgDef]
+    // For an enum.
+    enum_values: [GqlEnumValueDef]
+    // The interfaces an object — or, since the 2021 specification, an
+    // INTERFACE — implements.  That second case is what makes
+    // conformance a transitive check rather than a direct one.
+    interfaces: [Str]
+    // The member types of a union.
+    members: [Str]
+    // `@specifiedBy(url:)` on a custom scalar, empty otherwise.  The
+    // 2021 specification's answer to "what does this scalar mean" —
+    // and the only machine-readable one a custom scalar has.
+    specified_by: Str
+    directives: [gqllang.GqlDirectiveNode]
+    loc: gqlerr.GqlLoc
+
+// A directive definition (§ 3.13).
+pub struct GqlDirectiveDef
+    name: Str
+    description: Str
+    args: [GqlArgDef]
+    // The locations it may appear at, as the specification's own
+    // spellings: `FIELD`, `OBJECT`, `ARGUMENT_DEFINITION`, and the
+    // rest.
+    locations: [Str]
+    // Whether it may appear more than once at one location.  Added by
+    // the 2021 specification, and answered by
+    // `__Directive.isRepeatable`.
+    repeatable: Bool
+
+// A built schema: the types, the directives, and the three root
+// operation types.
+pub struct GqlSchema
+    types: [GqlTypeDef]
+    directives: [GqlDirectiveDef]
+    // The query root's type name.  REQUIRED — § 3.3 says a schema
+    // without one is not a schema, and `build` refuses.
+    query_type: Str
+    // The mutation root's, empty where there is none.
+    mutation_type: Str
+    // The subscription root's, empty where there is none.  A schema
+    // may declare one; `gqlexec` refuses to EXECUTE one, which is a
+    // different thing and is said in that module.
+    subscription_type: Str
+    description: Str
+
+// ── Parsing and building ─────────────────────────────────────────────
+
+// SDL parsed into type definitions, WITHOUT the resolution step.
+//
+// Syntax only.  Refuses an executable definition by name — a schema
+// file carrying `query { me }` is a configuration file with a request
+// in it — and answers the definitions in source order.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.parse("type Query { me: String }")
+//         Ok(ts) => println("${list.len(ts)}")
+//         Err(_) => println("not SDL")
+// ```
+pub fn parse(source: Str) -> Result<[GqlTypeDef], gqlerr.GqlFault> []
+    todo("graphql-nv.gqlsdl.parse")
+
+// SDL parsed AND resolved into a schema.
+//
+// The step that finds what syntax cannot: a field whose type is not
+// defined, a type implementing an interface it does not satisfy, two
+// definitions with one name, an input type used as an output type,
+// and a schema with no `Query`.  Every problem, not the first.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Ok(s)  => println(s.query_type)
+//         Err(_) => println("that schema cannot exist")
+// ```
+pub fn build(source: Str) -> Result<GqlSchema, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlsdl.build")
+
+// A schema built from definitions the caller assembled.
+//
+// For a gateway stitching several documents, and for a tool that
+// generated its types rather than writing them.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.parse("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(ts) =>
+//             match gqlsdl.build_from(ts, [], "Query", "", "")
+//                 Ok(s)  => println(s.query_type)
+//                 Err(_) => println("that schema cannot exist")
+// ```
+pub fn build_from(types: [GqlTypeDef], directives: [GqlDirectiveDef], query_type: Str,
+                  mutation_type: Str,
+                  subscription_type: Str) -> Result<GqlSchema, gqlerr.GqlFault> []
+    todo("graphql-nv.gqlsdl.build_from")
+
+// A schema printed back out as SDL, canonically.
+//
+// Types in a stable order, built-in scalars and directives omitted,
+// descriptions as block strings.  What a deployment publishes for its
+// clients, and what a schema-registry diff is taken over — which is
+// why the order is stable rather than source order: a diff over source
+// order reports a move as a change.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println(gqlsdl.print_schema(s))
+// ```
+pub fn print_schema(s: GqlSchema) -> Str []
+    todo("graphql-nv.gqlsdl.print_schema")
+
+// ── Asking a schema questions ────────────────────────────────────────
+
+// A type by name, or `None`.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqlsdl.type_named(s, "Query")
+//                 Some(t) => println(t.name)
+//                 None    => println("no such type")
+// ```
+pub fn type_named(s: GqlSchema, name: Str) -> ?GqlTypeDef []
+    todo("graphql-nv.gqlsdl.type_named")
+
+// A field of a named type, or `None`.
+//
+// Answers the three INTROSPECTION fields too — `__typename` on any
+// composite, `__schema` and `__type` on the query root — because a
+// caller that had to special-case them would special-case them
+// differently in the validator and the executor.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqlsdl.field_named(s, "Query", "__typename")
+//                 Some(f) => println(f.name)
+//                 None    => println("no such field")
+// ```
+pub fn field_named(s: GqlSchema, type_name: Str, field: Str) -> ?GqlFieldDef []
+    todo("graphql-nv.gqlsdl.field_named")
+
+// An argument of a field, or `None`.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { user(id: ID!): String }")
+//         Err(_) => println("no")
+//         Ok(s)  =>
+//             match gqlsdl.arg_named(s, "Query", "user", "id")
+//                 Some(a) => println(a.name)
+//                 None    => println("no such argument")
+// ```
+pub fn arg_named(s: GqlSchema, type_name: Str, field: Str, arg: Str) -> ?GqlArgDef []
+    todo("graphql-nv.gqlsdl.arg_named")
+
+// The object types a type could be at run time.
+//
+// One type for an object, every implementor for an interface, every
+// member for a union, empty for everything else.  § 5.5.2.3's "type
+// applicability" is an intersection of two of these, and computing it
+// separately in the validator and the executor is how the two come to
+// disagree about whether a fragment applies.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${list.len(gqlsdl.possible_types(s, "Query"))}")
+// ```
+pub fn possible_types(s: GqlSchema, type_name: Str) -> [Str] []
+    todo("graphql-nv.gqlsdl.possible_types")
+
+// Whether a value of `sub` is always a valid value of `sup`.
+//
+// § 5.5.2.3's fragment applicability, and § 6.4.3's field ordering,
+// both rest on it.  Handles the transitive case the 2021
+// specification added: an interface implementing an interface means
+// conformance is a walk rather than a lookup.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${gqlsdl.is_subtype(s, "Query", "Query")}")
+// ```
+pub fn is_subtype(s: GqlSchema, sub: Str, sup: Str) -> Bool []
+    todo("graphql-nv.gqlsdl.is_subtype")
+
+// Whether a named type may appear as an INPUT (§ 3.10).
+//
+// Scalars, enums and input objects, and the wrappers over them.  The
+// disjointness is the point: a schema that used one type for an
+// argument and a field is a schema that cannot exist, and this is the
+// predicate that says so.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${gqlsdl.is_input_type(s, "String")}")
+// ```
+pub fn is_input_type(s: GqlSchema, type_name: Str) -> Bool []
+    todo("graphql-nv.gqlsdl.is_input_type")
+
+// Whether a named type may appear as an OUTPUT.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${gqlsdl.is_output_type(s, "Query")}")
+// ```
+pub fn is_output_type(s: GqlSchema, type_name: Str) -> Bool []
+    todo("graphql-nv.gqlsdl.is_output_type")
+
+// Whether a named type needs a selection set on it.
+//
+// True for objects, interfaces and unions; false for scalars and
+// enums.  § 5.3.3's two rules — a composite field WITHOUT a selection
+// set, and a leaf field WITH one — are both this predicate, and they
+// are the two most common mistakes in a hand-written query.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${gqlsdl.is_composite(s, "String")}")
+// ```
+pub fn is_composite(s: GqlSchema, type_name: Str) -> Bool []
+    todo("graphql-nv.gqlsdl.is_composite")
+
+// The five names § 3.5 reserves: `Int`, `Float`, `String`, `Boolean`,
+// `ID`.
+//
+// Published because a schema may not redefine them and a tool
+// generating SDL must not emit them, and both of those are checks
+// somebody writes with a hard-coded list otherwise.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     println("${list.len(gqlsdl.builtin_scalars())}")
+// ```
+pub fn builtin_scalars() -> [Str] []
+    todo("graphql-nv.gqlsdl.builtin_scalars")
+
+// The three directives § 3.13.3 requires every schema to have:
+// `@skip`, `@include`, `@deprecated` — plus `@specifiedBy`, which the
+// 2021 specification added.
+//
+// A schema that omits them from its SDL still has them; `build` adds
+// them.  Published so a printer can leave them out of its output and a
+// diff does not report them as additions.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     println("${list.len(gqlsdl.builtin_directives())}")
+// ```
+pub fn builtin_directives() -> [Str] []
+    todo("graphql-nv.gqlsdl.builtin_directives")
+
+// Whether a name is reserved for introspection: two leading
+// underscores (§ 3.3).
+//
+// A schema may not define one, and a printer must not emit one.
+//
+// ```novo
+// use gqlsdl
+//
+// fn main() [io]
+//     println("${gqlsdl.is_reserved_name("__Type")}")
+// ```
+pub fn is_reserved_name(name: Str) -> Bool []
+    todo("graphql-nv.gqlsdl.is_reserved_name")
+
+// Every deprecated field and enum value in a schema, as
+// `Type.field` strings.
+//
+// For the report a deployment sends its clients before removing
+// something, and for the check a schema registry runs.  Published
+// because walking a schema for them is a walk everybody writes once
+// and writes slightly wrongly — a deprecated ENUM VALUE is the half
+// that gets missed.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(s)  => println("${list.len(gqlsdl.deprecations(s))}")
+// ```
+pub fn deprecations(s: GqlSchema) -> [Str] []
+    todo("graphql-nv.gqlsdl.deprecations")
+
+// What a change from one schema to another BREAKS for a client.
+//
+// A removed type, a removed field, a field whose type narrowed, an
+// argument that became required, a removed enum value, a removed union
+// member.  Every one, as a sentence.
+//
+// Asymmetric on purpose, and it is worth stating which way: in GraphQL
+// the client chooses the fields, so REMOVING from an output type
+// breaks clients and ADDING does not; and the client supplies the
+// arguments, so ADDING a required argument breaks clients and removing
+// one does not.  An enum is the awkward case — adding a value breaks a
+// client that exhaustively matched — and it is reported, because a
+// deployment should decide rather than discover.
+//
+// ```novo
+// use std.list
+// use gqlsdl
+//
+// fn main() [io]
+//     match gqlsdl.build("type Query { me: String }")
+//         Err(_) => println("no")
+//         Ok(a)  => println("${list.len(gqlsdl.breaking_changes(a, a))}")
+// ```
+pub fn breaking_changes(before: GqlSchema, after: GqlSchema) -> [Str] []
+    todo("graphql-nv.gqlsdl.breaking_changes")
