@@ -5,6 +5,10 @@ All notable changes to graphql-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -69,3 +73,22 @@ The **interface**: every signature and every effect row, and no bodies.
   move with no signature change.
 - No `tests/embedded_probe.nv`: this is a `host` package, so it makes
   no device claim to check.
+
+### Design notes
+
+The resolver is one trait with an effect parameter rather than a table
+of named functions. SPEC section 5.6 charges a generic function what
+its bounded argument's implementation supplies, but a bounded value
+reached through a container falls back to the union over every
+implementation. A table of resolvers is such a container, so it would
+have to name one fixed effect row, and the only row admitting every
+resolver anybody might write is the whole host budget. Every GraphQL
+server in the language would then declare `[io, fs, net, time, mutate]`
+whether it read a database or answered from a constant.
+
+Five of the seven modules — `gqlerr`, `gqllang`, `gqlsdl`, `gqlcheck`
+and `gqlintro` — declare no effects and name neither `gqlexec` nor
+`gqlhttp`, so a `graphql-core-nv` split would be a file move with no
+signature change. A linter, a code generator, a schema registry and a
+gateway each want those five and no executor, and today each has to
+take a `host` package for one it will not call.

@@ -1,6 +1,6 @@
 [package]
 name        = "graphql-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "GraphQL (October 2021): the schema language and the query language as effect-free modules, validation with the specification's rules named, and an executor whose resolver trait carries an effect parameter — so a server's declared row is what its resolvers actually do.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
