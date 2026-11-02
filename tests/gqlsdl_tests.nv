@@ -1,9 +1,6 @@
 // gqlsdl_tests.nv — the schema language, and the schemas that cannot
 // exist.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqlsdl.<fn>`.
-//
 // `parse` IS SYNTAX AND `build` IS THE OTHER HALF.  A field whose type
 // is not defined, a type claiming an interface it does not satisfy,
 // two definitions with one name, a schema with no `Query` — none of
@@ -14,6 +11,8 @@
 use std.test
 use std.list
 use std.str
+use gqlerr
+use gqllang
 use gqlsdl
 
 fn built(src: Str) -> ?gqlsdl.GqlSchema
@@ -30,6 +29,104 @@ fn a_pet_schema() -> Str
         + "enum Size { SMALL LARGE }\n"
         + "input PetFilter { size: Size }\n"
         + "type Query { pets(filter: PetFilter): [Pet!]! animal: Animal }\n"
+
+// A join written inside a MATCH ARM leaks one cell whether or not the
+// arm is ever taken, so every answer below is built through this
+// helper instead — a function whose whole body is the join is the
+// measured-clean shape.  The `+` can be written back at the site on a
+// toolchain that releases it.
+fn cat(parts: [Str]) -> Str
+    str.join(parts, "")
+
+fn cat_sep(parts: [Str], sep: Str) -> Str
+    str.join(parts, sep)
+
+// What `build` answers about a document, or "accepted" where it builds.
+fn refused(src: Str) -> Str
+    match gqlsdl.build(src)
+        Ok(_)  => "accepted"
+        Err(f) => f.message()
+
+// What `parse` answers — the half that is syntax only.
+fn syntax_refused(src: Str) -> Str
+    match gqlsdl.parse(src)
+        Ok(_)  => "accepted"
+        Err(f) => f.message()
+
+// One type's description as the schema holds it, or why there is none
+// to hold — the two answers are different, so this one says which.
+fn description_of(src: Str, name: Str) -> Str
+    match gqlsdl.build(src)
+        Err(f) => cat(["REFUSED: ", f.message()])
+        Ok(s)  => description_in(s, name)
+
+fn description_in(s: gqlsdl.GqlSchema, name: Str) -> Str
+    match gqlsdl.type_named(s, name)
+        None    => "NO SUCH TYPE"
+        Some(t) => t.description
+
+// A schema printed back out, or why it was not built.
+fn printed(src: Str) -> Str
+    match gqlsdl.build(src)
+        Ok(s)  => gqlsdl.print_schema(s)
+        Err(f) => cat(["REFUSED: ", f.message()])
+
+// Printed, read back, printed again: equal where the printer and the
+// parser agree, which is the property a schema registry's diff rests
+// on — a diff over two spellings of one schema is a diff of nothing.
+fn round_trip(src: Str) -> Bool
+    match gqlsdl.build(src)
+        Err(_) => false
+        Ok(s)  =>
+            let once = gqlsdl.print_schema(s)
+            match gqlsdl.build(once)
+                Err(_) => false
+                Ok(t)  => gqlsdl.print_schema(t) == once
+
+// The three roots a document names, as `query/mutation/subscription`.
+fn roots(src: Str) -> Str
+    match gqlsdl.build(src)
+        Ok(s)  => cat([s.query_type, "/", s.mutation_type, "/", s.subscription_type])
+        Err(f) => cat(["REFUSED: ", f.message()])
+
+// Definitions a caller assembled, handed to `build_from` with roots of
+// the caller's choosing.
+//
+// Two functions rather than one nested `match`: a `str.join` written
+// inside the inner arm of a nested match leaks one cell per call,
+// whether or not the arm runs, on this toolchain.
+fn assembled(src: Str, q: Str, m: Str, sub: Str) -> Str
+    match gqlsdl.parse(src)
+        Err(f) => cat(["PARSE REFUSED: ", f.message()])
+        Ok(ts) => assembled_from(ts, q, m, sub)
+
+fn assembled_from(ts: [GqlTypeDef], q: Str, m: Str, sub: Str) -> Str
+    match gqlsdl.build_from(ts, [], q, m, sub)
+        Ok(s)  => cat(["built ", s.query_type, "/", s.mutation_type, "/", s.subscription_type])
+        Err(f) => f.message()
+
+// Everything a change from one schema to another breaks, joined.
+fn breaks(before: Str, after: Str) -> Str
+    match gqlsdl.build(before)
+        Err(f) => cat(["BEFORE REFUSED: ", f.message()])
+        Ok(a)  =>
+            match gqlsdl.build(after)
+                Err(f) => cat(["AFTER REFUSED: ", f.message()])
+                Ok(b)  => cat_sep(gqlsdl.breaking_changes(a, b), " | ")
+
+// A schema using every kind of definition, every place a directive may
+// appear, and every shape the printer has a branch for.
+fn a_rich_schema() -> Str
+    "scalar Date @specifiedBy(url: \"https://scalars.graphql.org/date\")\n"
+        + "\"\"\"An animal.\"\"\"\n"
+        + "interface Node { id: ID! }\n"
+        + "enum Size { SMALL LARGE @deprecated(reason: \"use HUGE\") HUGE }\n"
+        + "input PetFilter { size: Size = SMALL limit: Int = 10 @tag }\n"
+        + "union Animal = Dog | Cat\n"
+        + "type Dog implements Node { id: ID! barks: Boolean }\n"
+        + "type Cat implements Node { id: ID! purrs: Boolean @deprecated }\n"
+        + "directive @tag(x: Int) repeatable on FIELD_DEFINITION | OBJECT\n"
+        + "type Query { pets(filter: PetFilter, first: Int = 5 @tag(x: 1)): [Animal!]! }"
 
 @test
 fn test_the_six_kinds_of_type_definition_parse() [io]
@@ -329,3 +426,542 @@ fn test_an_executable_definition_in_an_sdl_document_is_refused() [io]
     match gqlsdl.parse("query { me }")
         Ok(_)  => test.assert(false)
         Err(_) => test.assert(true)
+
+@test
+fn test_the_lexer_reads_the_tokens_a_schema_is_written_with() [io]
+    // § 2.2's ignored tokens and § 2.9's values, which a schema file
+    // uses in exactly two places: a description and a default.
+    test.case("a comment, a comma and a closing newline are ignored")
+    test.assert_eq_str(syntax_refused(
+        "# a note\ntype Query, { me: String } # trailing\n# end"),
+        "accepted")
+
+    test.case("a description is a string, and a block string is one too")
+    test.assert_eq_str(syntax_refused(
+        "\"\"\"An animal.\"\"\" interface Node { id: ID! }"),
+        "accepted")
+
+    test.case("a default may be a negative float, with a fraction and an exponent")
+    test.assert_eq_str(syntax_refused("input P { at: Float = -1.5e+3 }"), "accepted")
+    test.assert_eq_str(syntax_refused("input P { at: Float = 2.5e-1 }"), "accepted")
+
+    test.case("a document may end with a name, which ends where the document does")
+    test.assert_eq_str(syntax_refused("scalar Date"), "accepted")
+
+    test.case("`...` is a token, and no definition may be written with one")
+    test.assert_eq_str(syntax_refused("type Query { ... }"),
+                       "expected a field name (line 1, column 14)")
+
+    test.case("and a character that cannot start a token is named as one")
+    test.assert_eq_str(syntax_refused("?"),
+                       "a character that cannot start a token (line 1, column 1)")
+    test.assert_eq_str(syntax_refused("-"),
+                       "a character that cannot start a token (line 1, column 1)")
+
+@test
+fn test_a_string_that_never_closes_says_where_the_reader_stopped() [io]
+    // § 2.9.4.  The position reported for an unterminated string is the
+    // end of what was read, because that is where a reader looks for
+    // the quote that is missing.
+    test.case("a string that runs to the end of the document")
+    test.assert_eq_str(syntax_refused("\"abc"),
+                       "a string that runs to the end of the document (line 1, column 5)")
+
+    test.case("a block string that does")
+    test.assert_eq_str(syntax_refused("\"\"\"abc"),
+                       "a block string that runs to the end of the document (line 1, column 7)")
+
+    test.case("and a line break inside a single-line string")
+    test.assert_eq_str(syntax_refused("\"a\nb\""),
+                       "a line break inside a string (line 1, column 3)")
+
+@test
+fn test_a_document_that_runs_out_says_where_the_reader_got_to() [io]
+    // § 2.2 gives every token a position, and a truncated document is
+    // the commonest mistake in a hand-written schema — so every list
+    // the language opens answers where its close was expected.
+    test.case("a field list that never closes")
+    test.assert_eq_str(syntax_refused("type Query {"),
+                       "a field list that runs to the end of the document (line 1, column 13)")
+    test.assert_eq_str(syntax_refused("type Query { me: String"),
+                       "a field list that runs to the end of the document (line 1, column 24)")
+
+    test.case("an argument list that never closes")
+    test.assert_eq_str(syntax_refused("type Query { me(a: String"),
+                       "an argument list that runs to the end of the document (line 1, column 26)")
+
+    test.case("an input object's field list")
+    test.assert_eq_str(syntax_refused("input F { a: Int"),
+                       "an input field list that runs to the end of the document (line 1, column 17)")
+
+    test.case("an enum's value list")
+    test.assert_eq_str(syntax_refused("enum E { A"),
+                       "an enum value list that runs to the end of the document (line 1, column 11)")
+
+    test.case("a schema definition")
+    test.assert_eq_str(syntax_refused("schema { query: Query"),
+                       "a schema definition that runs to the end of the document (line 1, column 22)")
+
+    test.case("a list value inside a default")
+    test.assert_eq_str(syntax_refused("input F { a: [Int] = [1"),
+                       "a list value that runs to the end of the document (line 1, column 24)")
+
+    test.case("and an object value, whose cursor is past the document's own eof")
+    // The `}` never arrives and the reader walks one token past the
+    // eof token the lexer appended, so the position it reports is the
+    // synthetic line 0, column 0 — which is how a caller can tell "the
+    // document ran out" from "line 0 does not exist".
+    test.assert_eq_str(syntax_refused("input F { a: Int = { b"),
+                       "an object value that runs to the end of the document (line 0, column 0)")
+
+@test
+fn test_the_parser_names_what_it_wanted_where_it_wanted_it() [io]
+    // A position is half of a diagnostic: the same document with the
+    // same mistake twice needs the two places told apart.
+    test.case("a colon after a field name")
+    test.assert_eq_str(syntax_refused("type Query { me }"),
+                       "expected `:` after the field name (line 1, column 17)")
+
+    test.case("a colon after an argument name")
+    test.assert_eq_str(syntax_refused("type Query { me(a String): String }"),
+                       "expected `:` after the argument name (line 1, column 19)")
+
+    test.case("a colon after the operation kind in a schema block")
+    test.assert_eq_str(syntax_refused("schema { query Query }"),
+                       "expected `:` after the operation kind (line 1, column 16)")
+
+    test.case("a type after a field's colon")
+    test.assert_eq_str(syntax_refused("type Query { me: }"),
+                       "expected a type (line 1, column 19)")
+
+    test.case("a name where a type name is wanted")
+    test.assert_eq_str(syntax_refused("schema { query: 1 }"),
+                       "expected a type name (line 1, column 17)")
+
+    test.case("a type definition at the top level, from a word and from a token")
+    test.assert_eq_str(syntax_refused("1"),
+                       "expected a type definition (line 1, column 1)")
+    test.assert_eq_str(syntax_refused("nope"),
+                       "expected a type definition (line 1, column 1)")
+
+    test.case("an operation kind a schema block does not have")
+    test.assert_eq_str(syntax_refused("schema { nope: Query }\ntype Query { me: String }"),
+                       "`nope` is not an operation kind (line 1, column 22)")
+
+    test.case("a directive's argument list that never closes")
+    test.assert_eq_str(syntax_refused("type Query { me: String @tag("),
+                       "unterminated argument list (line 1, column 30)")
+
+    test.case("and a colon inside a directive's arguments")
+    test.assert_eq_str(syntax_refused("type Query { me: String @tag(x 1) }"),
+                       "expected `:` after the argument name (line 1, column 32)")
+
+    test.case("an executable definition, named as one rather than as a mistake")
+    test.assert_eq_str(syntax_refused("query { me }"),
+                       "`query` is an executable definition, and this entry point parses a schema (line 1, column 1)")
+
+@test
+fn test_a_default_may_be_any_value_the_language_writes() [io]
+    // § 2.9.  A default is a VALUE, and it is read by the same parser a
+    // query's arguments are, so a list and an object arrive here too —
+    // and so does the `$variable` spelling, which means nothing in a
+    // schema and still lexes.
+    test.case("an enum name, a list and an object")
+    let src = "enum Size { SMALL }\n"
+        + "input P { size: Size = SMALL tags: [String] = [\"a\", \"b\"] point: P2 = { x: 1 } }\n"
+        + "input P2 { x: Int }\n"
+        + "type Query { me: String }"
+    test.assert_eq_str(refused(src), "accepted")
+
+    test.case("and the values survive being printed and read back")
+    test.assert(round_trip(src))
+
+    test.case("a `\$variable`, which an executable document is the only thing that means")
+    test.assert_eq_str(syntax_refused("type Query { me(u: String = \$x): String }"), "accepted")
+
+@test
+fn test_every_kind_of_definition_prints_as_the_word_it_was_written_with() [io]
+    // The printer writes SDL and nothing else.  `__Type.kind` answers
+    // `OBJECT` and `INPUT_OBJECT`; § 3.4's schema language writes those
+    // two `type` and `input`, and a printer that reused the
+    // introspection word emitted `object Query { ... }` — a document
+    // this package's own `parse` refuses.
+    let out = printed(a_rich_schema())
+
+    test.case("an object and an interface")
+    test.assert(str.contains(out, "type Dog implements Node {"))
+    test.assert(str.contains(out, "interface Node {"))
+
+    test.case("an input object, an enum, a union and a scalar")
+    test.assert(str.contains(out, "input PetFilter {"))
+    test.assert(str.contains(out, "enum Size {"))
+    test.assert(str.contains(out, "union Animal = Dog | Cat"))
+    test.assert(str.contains(out, "scalar Date @specifiedBy(url: \"https://scalars.graphql.org/date\")"))
+
+    test.case("a directive definition, with its arguments and its locations")
+    test.assert(str.contains(out, "directive @tag(x: Int) repeatable on FIELD_DEFINITION | OBJECT"))
+
+    test.case("a field's arguments, its default and its directives")
+    test.assert(str.contains(out, "pets(filter: PetFilter, first: Int = 5 @tag(x: 1)): [Animal!]!"))
+
+    test.case("an input field's default")
+    test.assert(str.contains(out, "limit: Int = 10 @tag"))
+
+    test.case("a description, as a block string")
+    test.assert(str.contains(out, "\"\"\"An animal.\"\"\"\ninterface Node {"))
+
+    test.case("and an enum value's deprecation, which is the half a printer forgets")
+    test.assert(str.contains(out, "LARGE @deprecated(reason: \"use HUGE\")"))
+
+    test.case("everything printed reads back as the same text")
+    test.assert(round_trip(a_rich_schema()))
+
+@test
+fn test_the_printer_writes_the_four_wrapper_shapes_it_was_given() [io]
+    // § 2.11's four combinations of list and non-null.  A printer that
+    // indexes the non-null markers by how MANY there are rather than by
+    // which level they describe answers `[String!]` for `[String]`.
+    test.assert_eq_str(printed("type Query { a: [String] b: [String!] c: [String]! d: [String!]! }"),
+                       "type Query {\n  a: [String]\n  b: [String!]\n  c: [String]!\n  d: [String!]!\n}")
+
+@test
+fn test_a_description_is_read_the_one_way_this_package_reads_a_string() [io]
+    // A description is a string VALUE: the source between the quotes
+    // goes to `gqllang.parse_value`, so an escape is decoded once, and a
+    // block string's quote run is written back with a backslash so the
+    // document reads the same way the second time.
+    test.case("an escaped quote inside a single-line description")
+    test.assert_eq_str(description_of("\"say \\\"hi\\\"\"\ntype Query { me: String }", "Query"),
+                       "say \"hi\"")
+
+    test.case("and a quote run inside a block string, written with a backslash")
+    let run = "\"\"\"a \\\"\"\" b\"\"\"\ntype Query { me: String }"
+    test.assert_eq_str(description_of(run, "Query"), "a \"\"\" b")
+
+    test.case("which the printer writes back escaped, so the text it names survives it")
+    test.assert(str.contains(printed(run), "\\\"\"\""))
+    test.assert(round_trip(run))
+
+    test.case("and a description the value parser refuses leaves none rather than failing")
+    // The text is one the schema language cannot hold, so there is
+    // nothing to keep — but a description is not a definition, and a
+    // document is not refused over one.
+    test.assert_eq_str(description_of("\"a\\qb\"\ntype Query { me: String }", "Query"), "")
+    test.assert_eq_str(refused("\"a\\qb\"\ntype Query { me: String }"), "accepted")
+
+@test
+fn test_an_empty_union_and_a_bare_object_do_not_swallow_what_comes_next() [io]
+    // `union U = ` re-reads as a union whose first member is whatever
+    // the NEXT definition begins with — a type the deployment did not
+    // write there.
+    test.case("a union with no members prints without its equals sign")
+    test.assert_eq_str(printed("union U\ntype Query { me: String }"),
+                       "type Query {\n  me: String\n}\nunion U")
+    test.assert(round_trip("union U\ntype Query { me: String }"))
+
+    test.case("and an object with no fields prints without braces")
+    test.assert_eq_str(printed("type Query"), "type Query")
+    test.assert(round_trip("type Query"))
+
+    test.case("and so do an input object and an enum, which are lists with no braces at all")
+    test.assert_eq_str(printed("input I\nenum E\ntype Query { me: String }"),
+                       "enum E\ninput I\ntype Query {\n  me: String\n}")
+    test.assert(round_trip("input I\nenum E\ntype Query { me: String }"))
+
+@test
+fn test_a_schema_prints_in_a_stable_order_whatever_order_it_was_written_in() [io]
+    // Sorting by name is what makes a diff over two revisions of a
+    // schema file a diff of the schema rather than of the file.
+    let a = "type Query { me: String }\ninterface N { id: ID! }\nenum E { A }\n"
+        + "type A implements N { id: ID! }\nscalar Date\nunion U = A\ntype B { x: String }\n"
+    let b = "type B { x: String }\nunion U = A\nscalar Date\ntype A implements N { id: ID! }\n"
+        + "enum E { A }\ninterface N { id: ID! }\ntype Query { me: String }\n"
+    test.assert_eq_str(printed(a), printed(b))
+    test.assert(round_trip(a))
+    test.assert(round_trip(b))
+
+@test
+fn test_the_three_roots_are_named_by_a_schema_block_or_by_convention() [io]
+    // § 3.3.  A `schema` block names them; without one the three
+    // conventional names are the roots, and a document may extend a
+    // block it did not write.
+    test.case("a schema block names all three")
+    test.assert_eq_str(roots("schema { query: Q mutation: M subscription: S }\n"
+        + "type Q { me: String }\ntype M { a: String }\ntype S { b: String }"),
+        "Q/M/S")
+
+    test.case("and the conventional names are found without one")
+    test.assert_eq_str(roots("type Query { me: String }\ntype Mutation { a: String }\n"
+        + "type Subscription { b: String }"),
+        "Query/Mutation/Subscription")
+
+    test.case("a block may be extended, and the roots it does not name stay as they were")
+    test.assert_eq_str(roots("type Query { me: String }\ntype M { a: String }\n"
+        + "extend schema { mutation: M }"),
+        "Query/M/")
+
+    test.case("and a schema with no mutation or subscription root answers empty for them")
+    test.assert_eq_str(roots("type Query { me: String }"), "Query//")
+
+@test
+fn test_an_extension_merges_into_the_definition_it_names() [io]
+    // One type, written in two places — and an extension with nothing
+    // to extend is refused, because it would be the only half of a type.
+    test.case("an object's fields, in the order they were written")
+    test.assert_eq_str(printed("type Query { me: String }\nextend type Query { you: String }"),
+                       "type Query {\n  me: String\n  you: String\n}")
+
+    test.case("an interface's fields")
+    test.assert(str.contains(printed("interface N { id: ID! }\nextend interface N { name: String }\n"
+                                     + "type Query { me: String }"),
+                             "interface N {\n  id: ID!\n  name: String\n}"))
+
+    test.case("a union's members")
+    test.assert(str.contains(printed("type A { x: String }\ntype B { x: String }\nunion U = A\n"
+                                     + "extend union U = B\ntype Query { me: String }"),
+                             "union U = A | B"))
+
+    test.case("an enum's values")
+    test.assert(str.contains(printed("enum E { A }\nextend enum E { B }\ntype Query { me: String }"),
+                             "enum E {\n  A\n  B\n}"))
+
+    test.case("an input object's fields")
+    test.assert(str.contains(printed("input I { a: Int }\nextend input I { b: Int }\ntype Query { me: String }"),
+                             "input I {\n  a: Int\n  b: Int\n}"))
+
+    test.case("an extension with nothing to extend is refused")
+    test.assert_eq_str(refused("extend type Ghost { a: String }\ntype Query { me: String }"),
+                       "`extend` names a type that is not defined (line 2, column 1)")
+
+    test.case("and an `extend` with nothing after it is refused by name")
+    test.assert_eq_str(refused("extend nope"),
+                       "`extend` needs a type definition or a schema definition after it (line 1, column 8)")
+
+@test
+fn test_assembled_definitions_are_built_with_the_roots_the_caller_names() [io]
+    // `build_from` is how a gateway stitches documents, so the roots
+    // come from the caller rather than from the conventional names.
+    test.case("a root named anything at all")
+    test.assert_eq_str(assembled("type Q { me: String }", "Q", "", ""), "built Q//")
+
+    test.case("a mutation root that is not an object type")
+    test.assert_eq_str(assembled("type Query { me: String }\nenum Size { S }", "Query", "Size", ""),
+                       "the mutation root `Size` is not an object type")
+
+    test.case("a subscription root the definitions do not have")
+    test.assert_eq_str(assembled("type Query { me: String }", "Query", "", "Nope"),
+                       "the subscription root `Nope` is not an object type")
+
+    test.case("and no query root at all, which § 3.3 says is not a schema")
+    test.assert_eq_str(assembled("type Query { me: String }", "", "", ""),
+                       "this schema has no query root type, and § 3.3 says a schema needs one")
+
+@test
+fn test_a_definition_a_caller_assembled_may_name_no_type_at_all() [io]
+    // The other half of `build_from`'s contract: a definition a
+    // generator produced can carry a field whose type name came out
+    // empty.  Nothing is reported about an empty name — the two checks
+    // that would read one answer nothing rather than a sentence about a
+    // type called ``.
+    let none = GqlTypeRef { name: "", list_depth: 0, non_null: [false] }
+    let f = GqlFieldDef { name: "me", description: "", args: [], type_ref: none,
+                          deprecated: "", directives: [] }
+    let a = GqlArgDef { name: "x", description: "", type_ref: none, default_value: None,
+                        deprecated: "", directives: [] }
+    let t = GqlTypeDef { kind: GqlObject, name: "Query", description: "", fields: [f],
+                         input_fields: [a], enum_values: [], interfaces: [], members: [],
+                         specified_by: "", directives: [], loc: GqlLoc { line: 1, column: 1 } }
+    test.case("a field and an input field that name no type")
+    match gqlsdl.build_from([t], [], "Query", "", "")
+        Err(fault) => test.assert_eq_str(fault.message(), "accepted")
+        Ok(s)      => test.assert_eq_str(s.query_type, "Query")
+
+@test
+fn test_a_reference_that_cannot_be_resolved_is_refused_by_name_and_place() [io]
+    // § 3.6, § 3.9, § 3.10.  A schema with six undefined types reports
+    // six, because a person fixing them one build at a time is six
+    // builds.
+    test.case("a field's type is not defined")
+    test.assert_eq_str(refused("type Query { me: NoSuchType }"),
+                       "the type `NoSuchType`, which Query.me is written with, is not defined")
+
+    test.case("an argument's type is not defined")
+    test.assert_eq_str(refused("type Query { me(u: NoSuchType): String }"),
+                       "the type `NoSuchType`, which Query.me(u) is written with, is not defined")
+
+    test.case("an input object's field type is not defined")
+    test.assert_eq_str(refused("input F { a: NoSuchType }\ntype Query { me: String }"),
+                       "the type `NoSuchType`, which F.a is written with, is not defined")
+
+    test.case("an input object where an output type is wanted")
+    test.assert_eq_str(refused("input F { a: String }\ntype Query { me: F }"),
+                       "the type `F`, which Query.me is written with, cannot be an output type")
+
+    test.case("and an object where an input type is wanted")
+    test.assert_eq_str(refused("type U { a: String }\ntype Query { me(u: U): String }"),
+                       "the type `U`, which Query.me(u) is written with, cannot be an input type")
+
+    test.case("a union member that is not defined")
+    test.assert_eq_str(refused("union U = Ghost\ntype Query { me: String }"),
+                       "the union `U` has the member `Ghost`, which is not defined")
+
+    test.case("a union member that is not an object")
+    test.assert_eq_str(refused("enum S { A }\nunion U = S\ntype Query { me: String }"),
+                       "the union `U` has the member `S`, which is not an object type")
+
+    test.case("an interface that is not defined")
+    test.assert_eq_str(refused("type Query implements Ghost { me: String }"),
+                       "the type `Query` implements `Ghost`, which is not defined")
+
+    test.case("an interface that is not an interface")
+    test.assert_eq_str(refused("enum S { A }\ntype Query implements S { me: String }"),
+                       "the type `Query` implements `S`, which is not an interface")
+
+    test.case("a directive that is not defined, at every place one may appear")
+    test.assert_eq_str(refused("type Query @nope { me: String }"),
+                       "the directive `@nope` is not defined")
+    test.assert_eq_str(refused("type Query { me: String @nope }"),
+                       "the directive `@nope` is not defined")
+    test.assert_eq_str(refused("type Query { me(a: String @nope): String }"),
+                       "the directive `@nope` is not defined")
+    test.assert_eq_str(refused("input F { a: String @nope }\ntype Query { me: String }"),
+                       "the directive `@nope` is not defined")
+    test.assert_eq_str(refused("enum E { A @nope }\ntype Query { me: String }"),
+                       "the directive `@nope` is not defined")
+
+    test.case("and a directive that IS defined is a reference like any other")
+    test.assert_eq_str(refused("directive @tag on FIELD_DEFINITION\ntype Query { me: String @tag }"),
+                       "accepted")
+
+@test
+fn test_two_directive_definitions_with_one_name_are_refused_once() [io]
+    // The same rule as two types with one name, and the same failure
+    // mode: reporting it twice sends the reader looking for a second
+    // mistake.
+    test.assert_eq_str(refused("directive @tag on FIELD\ndirective @tag on FIELD\ntype Query { me: String }"),
+                       "the directive `@tag` is defined more than once")
+
+@test
+fn test_an_implementor_must_be_at_least_as_strict_as_its_interface() [io]
+    // § 3.6's conformance: the same type at every level, and non-null
+    // wherever the interface is.  A STRENGTHENING is allowed and a
+    // weakening is not, because a client holding the interface's type
+    // must be able to hold the implementor's.
+    test.case("a field the interface has and the implementor does not")
+    test.assert_eq_str(refused("interface N { id: ID! }\ntype Query implements N { me: String }"),
+                       "the type `Query` implements `N` and does not declare its field `id`")
+
+    test.case("a different named type")
+    test.assert_eq_str(refused("interface N { id: ID! }\ntype Query implements N { id: Int }"),
+                       "the type `Query` declares `id` as `Int`, which `N` does not allow: it says `ID!`")
+
+    test.case("a different list depth")
+    test.assert_eq_str(refused("interface N { id: [ID!]! }\ntype Query implements N { id: ID! }"),
+                       "the type `Query` declares `id` as `ID!`, which `N` does not allow: it says `[ID!]!`")
+
+    test.case("and a nullable field where the interface is non-null")
+    test.assert_eq_str(refused("interface N { id: ID! }\ntype Query implements N { id: ID }"),
+                       "the type `Query` declares `id` as `ID`, which `N` does not allow: it says `ID!`")
+
+    test.case("a strengthening is not a break: the interface is the weaker promise")
+    test.assert_eq_str(refused("interface N { id: ID }\ntype Query implements N { id: ID! }"), "accepted")
+
+    test.case("and an interface's own interfaces must be declared, not only satisfied")
+    test.assert_eq_str(refused("interface Node { id: ID! }\n"
+                               + "interface Pet implements Node { id: ID! }\n"
+                               + "type Query implements Pet { id: ID! }"),
+                       "the type `Query` implements `Pet`, so it must also declare that it implements `Node`")
+
+@test
+fn test_the_questions_answer_no_for_a_name_the_schema_does_not_have() [io]
+    // A caller that asked whether a name is an output type is asking a
+    // question with an answer, and the answer is no — not a fault, and
+    // not an empty list where a list of types was wanted.
+    match built(a_pet_schema())
+        None    => test.assert(false)
+        Some(s) =>
+            test.case("a type, a field and an argument that are not there")
+            test.assert_none(gqlsdl.type_named(s, "Nope"))
+            test.assert_none(gqlsdl.field_named(s, "Nope", "me"))
+            test.assert_none(gqlsdl.field_named(s, "Query", "nope"))
+            test.assert_none(gqlsdl.arg_named(s, "Query", "nope", "id"))
+            test.assert_none(gqlsdl.arg_named(s, "Query", "pets", "nope"))
+
+            test.case("no possible types, no compositeness, no input, no output")
+            test.assert(list.is_empty(gqlsdl.possible_types(s, "Nope")))
+            test.assert(not gqlsdl.is_composite(s, "Nope"))
+            test.assert(not gqlsdl.is_input_type(s, "Nope"))
+            test.assert(not gqlsdl.is_output_type(s, "Nope"))
+
+            test.case("and a subtype question, in all three of its ways to miss")
+            test.assert(not gqlsdl.is_subtype(s, "Dog", "Nope"))
+            test.assert(not gqlsdl.is_subtype(s, "Nope", "Size"))
+            test.assert(not gqlsdl.is_subtype(s, "Size", "Query"))
+
+            test.case("while § 4.5's meta-types answer like any other type")
+            // A schema does not define `__Type`, and a lookup that only
+            // searched the definitions would answer a query asking for
+            // it with "no such type" — a lie about a type this package
+            // hands out.
+            test.assert_some(gqlsdl.type_named(s, "__Type"))
+            test.assert_some(gqlsdl.field_named(s, "__Type", "kind"))
+            test.assert(gqlsdl.is_output_type(s, "__Type"))
+            test.assert(gqlsdl.is_composite(s, "__Type"))
+
+@test
+fn test_a_broken_change_is_a_sentence_with_the_direction_in_it() [io]
+    // The asymmetry is the specification's, and it is worth stating
+    // which way: the client chooses the fields, so REMOVING from an
+    // output type breaks clients and adding does not; and the client
+    // supplies the arguments, so ADDING a required argument breaks
+    // clients and removing one does not.
+    test.case("a removed type and a removed field")
+    test.assert_eq_str(breaks("type Query { me: String }\ntype Ghost { a: String }",
+                              "type Query { me: String }"),
+                       "the type `Ghost` was removed")
+    test.assert_eq_str(breaks("type Query { me: String you: String }", "type Query { me: String }"),
+                       "the field `Query.you` was removed")
+
+    test.case("a narrowed field type, which is three ways to narrow")
+    test.assert_eq_str(breaks("type Query { me: Int }", "type Query { me: String }"),
+                       "the type of `Query.me` narrowed from `Int` to `String`")
+    test.assert_eq_str(breaks("type Query { me: String }", "type Query { me: [String] }"),
+                       "the type of `Query.me` narrowed from `String` to `[String]`")
+    test.assert_eq_str(breaks("type Query { me: String }", "type Query { me: String! }"),
+                       "the type of `Query.me` narrowed from `String` to `String!`")
+
+    test.case("and a field that STOPPED being non-null is not reported")
+    // `narrowed` reads one way: does the new type promise less?  A
+    // non-null wrapper appearing is the direction a resolver failure
+    // turns into a nulled parent, which is why it is the one this
+    // package calls a narrowing — and the opposite change, a field
+    // that became nullable, is one a client already had to handle.
+    test.assert_eq_str(breaks("type Query { me: String! }", "type Query { me: String }"), "")
+
+    test.case("an enum value removed, and one added")
+    test.assert_eq_str(breaks("enum S { A B }\ntype Query { me: S }", "enum S { A }\ntype Query { me: S }"),
+                       "the enum value `S.B` was removed")
+    test.assert_eq_str(breaks("enum S { A }\ntype Query { me: S }", "enum S { A B }\ntype Query { me: S }"),
+                       "the enum value `S.B` was added, which breaks a client that matched every value")
+
+    test.case("a union member removed")
+    test.assert_eq_str(breaks("type A { x: String }\ntype B { x: String }\nunion U = A | B\ntype Query { me: U }",
+                              "type A { x: String }\ntype B { x: String }\nunion U = A\ntype Query { me: U }"),
+                       "the union member `U.B` was removed")
+
+    test.case("an interface no longer implemented")
+    test.assert_eq_str(breaks("interface N { id: ID! }\ntype A implements N { id: ID! }\ntype Query { me: A }",
+                              "interface N { id: ID! }\ntype A { id: ID! }\ntype Query { me: A }"),
+                       "the type `A` no longer implements `N`")
+
+    test.case("an argument added that has no default")
+    test.assert_eq_str(breaks("type Query { me: String }", "type Query { me(id: ID!): String }"),
+                       "the argument `Query.me(id:)` was added and has no default")
+
+    test.case("an argument that became required")
+    test.assert_eq_str(breaks("type Query { me(id: ID): String }", "type Query { me(id: ID!): String }"),
+                       "the argument `Query.me(id:)` became required")
+
+    test.case("and an OPTIONAL argument added or removed is not a break either way")
+    test.assert_eq_str(breaks("type Query { me: String }", "type Query { me(id: ID): String }"), "")
+    test.assert_eq_str(breaks("type Query { me(id: ID): String }", "type Query { me: String }"), "")

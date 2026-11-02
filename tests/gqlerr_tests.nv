@@ -1,8 +1,5 @@
 // gqlerr_tests.nv — the two error vocabularies, and the one thing a
 // client branches on.
-//
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqlerr.<fn>`.
 
 use std.test
 use std.list

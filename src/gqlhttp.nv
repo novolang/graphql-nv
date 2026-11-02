@@ -1,8 +1,6 @@
 // gqlhttp.nv — the shape a `web` row mounts: a request read out of a
 // body or a query, and a response written back.  `[]`.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // NOTHING HERE PERFORMS ANYTHING, and that is the whole reason it is a
 // separate module.  A GraphQL transport is a small amount of parsing
 // and a large amount of POLICY — which method, which media type, which
@@ -37,9 +35,18 @@
 // an `Allow: POST`, which is the answer that tells the client what to
 // do instead.
 
+use std.json
+use std.list
+use std.str
 use formurl
 use gqlerr
 use gqlexec
+use gqllang
+
+// The body ceiling the conventional policy sets: one mebibyte, which
+// is past any document a client writes by hand and short of the body
+// that ends a server.
+const MAX_BODY_BYTES = 1048576
 
 // What a deployment allows over HTTP.
 pub struct GqlHttpPolicy
@@ -65,7 +72,8 @@ pub struct GqlHttpPolicy
 //     println("${gqlhttp.defaults().allow_get_mutation}")
 // ```
 pub fn defaults() -> GqlHttpPolicy []
-    todo("graphql-nv.gqlhttp.defaults")
+    GqlHttpPolicy { allow_get: true, allow_get_mutation: false,
+                    max_body_bytes: MAX_BODY_BYTES, read_extensions: true }
 
 // The same, refusing GET entirely.
 //
@@ -79,9 +87,109 @@ pub fn defaults() -> GqlHttpPolicy []
 //     println("${gqlhttp.post_only().allow_get}")
 // ```
 pub fn post_only() -> GqlHttpPolicy []
-    todo("graphql-nv.gqlhttp.post_only")
+    GqlHttpPolicy { allow_get: false, allow_get_mutation: false,
+                    max_body_bytes: MAX_BODY_BYTES, read_extensions: true }
 
 // ── Reading a request ────────────────────────────────────────────────
+
+// Whether a member is present and is a string.
+//
+// A member that is present and is NOT a string is refused rather than
+// read as absent: a client that sent `"operationName": 3` sent
+// something, and quietly answering the only operation in the document
+// is an answer to a different question.
+fn member_is_string(v: json.JsonValueH, key: Str) -> Bool []
+    match json.get(v, key)
+        None    => true
+        Some(m) => json.type_of(m) == "string"
+
+// Whether a member is present and is an object.
+fn member_is_object(v: json.JsonValueH, key: Str) -> Bool []
+    match json.get(v, key)
+        None    => true
+        Some(m) => json.type_of(m) == "object"
+
+// A member as text, or empty where it is absent.
+fn member_text(v: json.JsonValueH, key: Str) -> Str []
+    json.get_str(v, key) ?? ""
+
+// A member that is an object, as JSON text.
+//
+// The executor is handed TEXT rather than a value, so a member that
+// arrived parsed is written back out — and `json.stringify` preserves
+// the order the client wrote, which is the order a resolver reading
+// the variables will see.
+fn member_object_text(v: json.JsonValueH, key: Str) -> Str []
+    match json.get(v, key)
+        None    => ""
+        Some(m) => json.stringify(m)
+
+// The `extensions` member, where the policy reads it at all.
+fn extensions_member(v: json.JsonValueH, p: GqlHttpPolicy) -> Str []
+    if p.read_extensions
+        member_object_text(v, "extensions")
+    else
+        ""
+
+// A POST body's JSON object as a request.
+fn object_request(v: json.JsonValueH,
+                  p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    if not member_is_string(v, "query")
+        Err(gqlerr.GqlRequestMalformed("`query` is not a string"))
+    elif str.len(member_text(v, "query")) == 0
+        Err(gqlerr.GqlRequestMalformed("the request has no `query` member"))
+    elif not member_is_string(v, "operationName")
+        Err(gqlerr.GqlRequestMalformed("`operationName` is not a string"))
+    elif not member_is_object(v, "variables")
+        Err(gqlerr.GqlRequestMalformed("`variables` is not a JSON object"))
+    elif p.read_extensions and not member_is_object(v, "extensions")
+        Err(gqlerr.GqlRequestMalformed("`extensions` is not a JSON object"))
+    else
+        Ok(GqlRequest { query: member_text(v, "query"),
+                        operation_name: member_text(v, "operationName"),
+                        variables: member_object_text(v, "variables"),
+                        extensions: extensions_member(v, p) })
+
+// A parameter's value, or empty where the parameter is absent.
+fn param(b: formurl.FormBody, key: Str) -> Str []
+    match formurl.get(b, key)
+        Some(v) => v
+        None    => ""
+
+// Whether a parameter arrives more than once.
+//
+// form-nv SEES every occurrence; `http.server.query_get` would answer
+// the first and drop the rest, and a request whose meaning depends on
+// which of two `query` parameters a server picked is a request no
+// client sent.
+fn repeated(b: formurl.FormBody, key: Str) -> Bool []
+    formurl.count(b, key) > 1
+
+// A JSON object carried inside a parameter, as text.
+//
+// Empty is the absent case and is not an error, because both members
+// it is used for are optional.
+fn object_param(text: Str, name: Str) -> Result<Str, gqlerr.GqlFault> []
+    if str.len(text) == 0
+        Ok("")
+    else
+        match json.parse(text)
+            None    => Err(gqlerr.GqlRequestMalformed("`" + name + "` is not JSON"))
+            Some(v) => object_text_of(v, name)
+
+// A parsed parameter that has to be an object.
+fn object_text_of(v: json.JsonValueH, name: Str) -> Result<Str, gqlerr.GqlFault> []
+    if json.type_of(v) == "object"
+        Ok(json.stringify(v))
+    else
+        Err(gqlerr.GqlRequestMalformed("`" + name + "` is not a JSON object"))
+
+// The `extensions` parameter of a form body, where the policy reads it.
+fn extensions_param(b: formurl.FormBody, p: GqlHttpPolicy) -> Result<Str, gqlerr.GqlFault> []
+    if p.read_extensions
+        object_param(param(b, "extensions"), "extensions")
+    else
+        Ok("")
 
 // A POST body read into a request.
 //
@@ -100,7 +208,20 @@ pub fn post_only() -> GqlHttpPolicy []
 //         Err(_) => println("not a GraphQL request")
 // ```
 pub fn read_post(body: Str, p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlhttp.read_post")
+    if str.len(body) > p.max_body_bytes
+        Err(gqlerr.GqlTooLarge("request body", str.len(body), p.max_body_bytes))
+    else
+        match json.parse(body)
+            None    => Err(gqlerr.GqlRequestMalformed("the body is not JSON"))
+            Some(v) => object_body(v, p)
+
+// A parsed POST body that has to be an object.
+fn object_body(v: json.JsonValueH,
+               p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    if json.type_of(v) == "object"
+        object_request(v, p)
+    else
+        Err(gqlerr.GqlRequestMalformed("the body is JSON and is not an object"))
 
 // A GET query string read into a request.
 //
@@ -124,7 +245,7 @@ pub fn read_post(body: Str, p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqle
 // ```
 pub fn read_get(query_string: Str,
                 p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlhttp.read_get")
+    read_form(formurl.parse_str(query_string), p)
 
 // The same, from a form body already parsed.
 //
@@ -141,7 +262,35 @@ pub fn read_get(query_string: Str,
 // ```
 pub fn read_form(b: formurl.FormBody,
                  p: GqlHttpPolicy) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlhttp.read_form")
+    if not p.allow_get
+        Err(gqlerr.GqlRequestMalformed("this deployment answers GET with a 405 and `Allow: POST`"))
+    elif repeated(b, "query")
+        Err(gqlerr.GqlRequestMalformed("the `query` parameter appears more than once"))
+    elif repeated(b, "variables")
+        Err(gqlerr.GqlRequestMalformed("the `variables` parameter appears more than once"))
+    elif repeated(b, "extensions")
+        Err(gqlerr.GqlRequestMalformed("the `extensions` parameter appears more than once"))
+    elif not formurl.has(b, "query")
+        Err(gqlerr.GqlRequestMalformed("the request has no `query` parameter"))
+    else
+        let vars = object_param(param(b, "variables"), "variables")!
+        if_extensions(b, p, vars)
+
+// A form body whose variables are read, onto its extensions.
+fn if_extensions(b: formurl.FormBody, p: GqlHttpPolicy,
+                 vars: Str) -> Result<gqlexec.GqlRequest, gqlerr.GqlFault> []
+    let ext = extensions_param(b, p)!
+    Ok(GqlRequest { query: param(b, "query"),
+                            operation_name: param(b, "operationName"),
+                            variables: vars,
+                            extensions: ext })
+
+// Whether a document's operation is a write.
+fn is_mutation(kind: gqllang.GqlOpKind) -> Bool []
+    match kind
+        GqlMutation     => true
+        GqlQuery        => false
+        GqlSubscription => false
 
 // Whether a GET must be refused because its document mutates.
 //
@@ -161,7 +310,7 @@ pub fn read_form(b: formurl.FormBody,
 //     println("${gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlMutation)}")
 // ```
 pub fn refuses_get_mutation(p: GqlHttpPolicy, kind: gqllang.GqlOpKind) -> Bool []
-    todo("graphql-nv.gqlhttp.refuses_get_mutation")
+    is_mutation(kind) and not p.allow_get_mutation
 
 // The `Allow` header for a refused GET: `POST`.
 //
@@ -172,7 +321,18 @@ pub fn refuses_get_mutation(p: GqlHttpPolicy, kind: gqllang.GqlOpKind) -> Bool [
 //     println(gqlhttp.allow_header())
 // ```
 pub fn allow_header() -> Str []
-    todo("graphql-nv.gqlhttp.allow_header")
+    "POST"
+
+// A media type with its case, its whitespace and its parameters
+// removed: `Application/JSON; charset=utf-8` is `application/json`.
+//
+// § 3.1's header is case-insensitive, and a parameter is a fact about
+// the bytes that follow the type rather than part of the type.
+fn bare_media_type(value: Str) -> Str []
+    let lower = str.lower(str.trim(value))
+    match str.index(lower, ";")
+        None    => lower
+        Some(i) => str.trim(str.slice(lower, 0, i))
 
 // Whether a request's `Content-Type` is one this transport reads.
 //
@@ -189,9 +349,23 @@ pub fn allow_header() -> Str []
 //     println("${gqlhttp.reads_content_type("application/json; charset=utf-8")}")
 // ```
 pub fn reads_content_type(content_type: Str) -> Bool []
-    todo("graphql-nv.gqlhttp.reads_content_type")
+    bare_media_type(content_type) == "application/json"
 
 // ── Writing a response ───────────────────────────────────────────────
+
+// The media type the specification added, and the one under which a
+// request error is a 400.
+fn modern_media() -> Str []
+    "application/graphql-response+json"
+
+// The media type every GraphQL server answered before the
+// specification, and the one a client that asked for nothing gets.
+fn legacy_media() -> Str []
+    "application/json"
+
+// Whether a negotiated media type is the modern one.
+fn is_modern(media_type: Str) -> Bool []
+    bare_media_type(media_type) == modern_media()
 
 // The media type a request's `Accept` header negotiates to.
 //
@@ -207,7 +381,10 @@ pub fn reads_content_type(content_type: Str) -> Bool []
 //     println(gqlhttp.negotiate("application/graphql-response+json"))
 // ```
 pub fn negotiate(accept: Str) -> Str []
-    todo("graphql-nv.gqlhttp.negotiate")
+    if str.contains(str.lower(accept), modern_media())
+        modern_media()
+    else
+        legacy_media()
 
 // The status a response gets, given the negotiated media type.
 //
@@ -235,7 +412,17 @@ pub fn negotiate(accept: Str) -> Str []
 //     println("${gqlhttp.status_for(r, "application/json")}")
 // ```
 pub fn status_for(r: gqlexec.GqlResponse, media_type: Str) -> Int []
-    todo("graphql-nv.gqlhttp.status_for")
+    // A response with no `data` member at all is a request that never
+    // executed, and only errors in it make it the client's fault.  A
+    // response with NEITHER — the shape a probe answers — executed
+    // nothing and failed at nothing, and a 400 for it would be a
+    // refusal invented out of an empty body.
+    if gqlexec.has_data(r)
+        200
+    elif list.len(r.errors) > 0 and is_modern(media_type)
+        400
+    else
+        200
 
 // The status for a request that never became an execution.
 //
@@ -251,7 +438,16 @@ pub fn status_for(r: gqlexec.GqlResponse, media_type: Str) -> Int []
 //     println("${gqlhttp.status_for_fault(f, "application/graphql-response+json")}")
 // ```
 pub fn status_for_fault(f: gqlerr.GqlFault, media_type: Str) -> Int []
-    todo("graphql-nv.gqlhttp.status_for_fault")
+    // A schema fault is the deployment's and not the client's: every
+    // request against it fails identically until somebody fixes it,
+    // and a 400 tells the client to fix its document.  `gqlerr` keeps
+    // the distinction for this caller.
+    if gqlerr.is_configuration_fault(f)
+        500
+    elif is_modern(media_type)
+        400
+    else
+        200
 
 // The `Content-Type` header for a response in a media type.
 //
@@ -266,12 +462,16 @@ pub fn status_for_fault(f: gqlerr.GqlFault, media_type: Str) -> Int []
 //     println(gqlhttp.content_type("application/json"))
 // ```
 pub fn content_type(media_type: Str) -> Str []
-    todo("graphql-nv.gqlhttp.content_type")
+    media_type + "; charset=utf-8"
 
 // The headers a response carries, in order.
 //
-// `Content-Type`, and `Allow` on a 405.  Published as a list so a
-// caller attaches them without deciding which.
+// `Content-Type`, and nothing else: a GraphQL response has one header,
+// and the `Allow` a refused GET answers belongs to the 405 the CALLER
+// answered — a `GqlResponse` does not know which method asked for it,
+// and `allow_header` is the value that caller attaches.
+//
+// Published as a list so a caller attaches them without deciding which.
 //
 // ```novo
 // use std.list
@@ -283,9 +483,16 @@ pub fn content_type(media_type: Str) -> Str []
 //     println("${list.len(gqlhttp.response_headers(r, "application/json"))}")
 // ```
 pub fn response_headers(r: gqlexec.GqlResponse, media_type: Str) -> [(Str, Str)] []
-    todo("graphql-nv.gqlhttp.response_headers")
+    [("Content-Type", content_type(media_type))]
 
 // A fault as a response body, in the media type negotiated.
+//
+// The two media types differ in more than their status code: under
+// `application/graphql-response+json` a request error's body carries
+// `errors` and no `data` member, and under `application/json` it
+// carries `"data": null` as well — which is what the clients written
+// against the legacy behaviour were read by, and one more reason the
+// status is not the only thing the negotiation decides.
 //
 // ```novo
 // use gqlerr
@@ -296,9 +503,31 @@ pub fn response_headers(r: gqlexec.GqlResponse, media_type: Str) -> [(Str, Str)]
 //     println(gqlhttp.fault_body(f, "application/json"))
 // ```
 pub fn fault_body(f: gqlerr.GqlFault, media_type: Str) -> Str []
-    todo("graphql-nv.gqlhttp.fault_body")
+    if is_modern(media_type)
+        gqlexec.response_json(gqlexec.error_response(gqlerr.errors_of(f)))
+    else
+        gqlexec.response_json(GqlResponse { data: "null",
+                                            errors: gqlerr.errors_of(f),
+                                            extensions: "" })
 
 // ── Cross-site request forgery ───────────────────────────────────────
+
+// Whether one named header is the thing its entry in the published
+// list is about.
+//
+// `Content-Type` counts when it is JSON, because a form can only send
+// three content types and none of them is JSON; the others count when
+// they are there at all, because a request carrying a header of its
+// own has been through a CORS preflight.
+fn reads_a_preflight(name: Str, value: Str) -> Bool []
+    if name == "Content-Type"
+        reads_content_type(value)
+    else
+        str.len(value) > 0
+
+// The names, in the order a person reads them.
+fn preflight_header_names() -> [Str] []
+    ["Content-Type", "X-Apollo-Operation-Name", "Apollo-Require-Preflight"]
 
 // Whether a request's headers show it was sent by a program rather
 // than by a form a page on another site submitted.
@@ -325,7 +554,11 @@ pub fn fault_body(f: gqlerr.GqlFault, media_type: Str) -> Str []
 //     println("${gqlhttp.looks_preflighted(no_headers)}")
 // ```
 pub fn looks_preflighted(header: fn(Str) -> Str []) -> Bool []
-    todo("graphql-nv.gqlhttp.looks_preflighted")
+    var preflighted: Bool = false
+    for name in preflight_header_names()
+        if reads_a_preflight(name, header(name))
+            preflighted = true
+    preflighted
 
 // The headers whose presence `looks_preflighted` accepts, as strings a
 // person can read.
@@ -342,9 +575,15 @@ pub fn looks_preflighted(header: fn(Str) -> Str []) -> Bool []
 //     println("${list.len(gqlhttp.preflight_headers())}")
 // ```
 pub fn preflight_headers() -> [Str] []
-    todo("graphql-nv.gqlhttp.preflight_headers")
+    preflight_header_names()
 
 // ── Persisted queries ────────────────────────────────────────────────
+
+// The hash out of Apollo's `persistedQuery` object.
+fn hash_member(v: json.JsonValueH) -> Str []
+    match json.get(v, "persistedQuery")
+        None     => ""
+        Some(pq) => json.get_str(pq, "sha256Hash") ?? ""
 
 // The persisted-query hash a request's `extensions` carries, or empty.
 //
@@ -363,7 +602,12 @@ pub fn preflight_headers() -> [Str] []
 //     println(gqlhttp.persisted_hash(gqlexec.request("{ me }")))
 // ```
 pub fn persisted_hash(req: gqlexec.GqlRequest) -> Str []
-    todo("graphql-nv.gqlhttp.persisted_hash")
+    if str.len(req.extensions) == 0
+        ""
+    else
+        match json.parse(req.extensions)
+            None    => ""
+            Some(v) => hash_member(v)
 
 // The error a server answers for a persisted query it does not know.
 //
@@ -380,4 +624,4 @@ pub fn persisted_hash(req: gqlexec.GqlRequest) -> Str []
 //     println(gqlerr.code_of(gqlhttp.persisted_not_found()))
 // ```
 pub fn persisted_not_found() -> gqlerr.GqlError []
-    todo("graphql-nv.gqlhttp.persisted_not_found")
+    gqlerr.error_with_code("PersistedQueryNotFound", "PERSISTED_QUERY_NOT_FOUND")

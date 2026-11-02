@@ -11,12 +11,6 @@ novo-lang. It is a port of
 [async-graphql](https://github.com/async-graphql/async-graphql) and
 [strawberry](https://strawberry.rocks).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What GraphQL is
 
 A server publishes a **schema**: a set of types, each with named
@@ -106,12 +100,10 @@ fn main() [io]
                             println(e.message)
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-is almost entirely red on purpose: nearly every test reaches a
-`not implemented: graphql-nv.<module>.<fn>` panic. The exceptions are
-three tests in `tests/gqlexec_tests.nv`, which assert about the shape
-of the resolver trait rather than about any body, and which the
-compiler decides before the run starts.
+Build and test with `novo pkg build` and `novo test`. The seven
+modules' bodies are implemented and every suite is green; the
+`[io]`-only rows below run without a socket, because the package's own
+performed row is empty and the socket belongs to the caller's server.
 
 ## What the package contains
 
@@ -231,10 +223,10 @@ generator or a schema registry uses those five and never runs a query.
 | `GqlLimits` field | What it bounds | `default_limits()` |
 | --- | --- | --- |
 | `max_depth` | The deepest selection set | 15 |
-| `max_breadth` | The most selections in one set | a positive number |
-| `max_bytes` | The most bytes in the document | a positive number |
-| `max_aliases` | The most aliases in the document | a positive number |
-| `max_spreads` | The most fragment spreads | a positive number |
+| `max_breadth` | The most selections in one set | 100 |
+| `max_bytes` | The most bytes in the document | 65536 |
+| `max_aliases` | The most aliases in the document | 100 |
+| `max_spreads` | The most fragment spreads | 256 |
 
 `gqllang.no_limits()` sets every bound to zero, meaning no ceiling. It
 is a named function rather than five fields a caller zeroes, so a
@@ -307,53 +299,13 @@ content type is not read, that a response carrying errors is still a
 200 when execution began, and that no `data` member and a null `data`
 are distinguishable.
 
-Three tests in `tests/gqlexec_tests.nv` pass today. They implement the
-resolver trait twice, once at `GqlResolver[]` and once at
-`GqlResolver[fs]`, and call `execute` against both: the test over the
-first declares `[io]` and the test over the second declares
-`[io, fs]`. The compiler decides that before the run starts, so those
-three assert about the interface rather than about a body.
-
-Every other test compiles today and fails at run, each on the
-`not implemented: graphql-nv.<module>.<fn>` panic that is its body.
-That is the expected state of an interface release. They turn green one
-at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| Every `pub struct`, `pub enum` and `pub trait` in the seven modules | the types are declared |
-| `gqlerr.error`, `.error_with_code`, `.at`, `.at_path`, `.with_extensions` | no |
-| `gqlerr.code_of`, `.path_text`, `.error_json` | no |
-| `gqlerr.errors_of`, `.is_request_error`, `.is_configuration_fault`, `.is_client_safe` | no |
-| `gqlerr.GqlFault.message` | no |
-| `gqllang.default_limits`, `.no_limits`, `.limits` | no |
-| `gqllang.parse_executable`, `.operation_of`, `.fragment_of` | no |
-| `gqllang.print_document`, `.print_selections`, `.print_value`, `.print_type` | no |
-| `gqllang.parse_value`, `.null_value`, `.parse_type`, `.named_type` | no |
-| `gqllang.is_non_null`, `.is_list`, `.inner_type` | no |
-| `gqllang.depth_of`, `.alias_count`, `.field_count`, `.response_key`, `.field_selection` | no |
-| `gqlsdl.parse`, `.build`, `.build_from`, `.print_schema` | no |
-| `gqlsdl.type_named`, `.field_named`, `.arg_named`, `.possible_types` | no |
-| `gqlsdl.is_subtype`, `.is_input_type`, `.is_output_type`, `.is_composite` | no |
-| `gqlsdl.builtin_scalars`, `.builtin_directives`, `.is_reserved_name` | no |
-| `gqlsdl.deprecations`, `.breaking_changes` | no |
-| `gqlcheck.validate`, `.is_valid`, `.validate_only`, `.validate_except` | no |
-| `gqlcheck.rule_names`, `.rule_section`, `.unchecked_rules` | no |
-| `gqlcheck.fragment_cycle`, `.merge_conflicts`, `.variable_problems`, `.impossible_fragments`, `.directive_problems` | no |
-| `gqlcheck.coerce_variables`, `.value_fits`, `.selection_included` | no |
-| `gqlintro.defaults`, `.closed`, `.is_meta_field`, `.answers` | no |
-| `gqlintro.schema_value`, `.type_value`, `.document`, `.schema_of` | no |
-| `gqlintro.introspection_query`, `.meta_type_names`, `.type_kind_name`, `.directive_locations`, `.suggest_field` | no |
-| `gqlexec.execute`, `.execute_document` | no |
-| `gqlexec.request`, `.with_variables`, `.with_operation` | no |
-| `gqlexec.response_json`, `.empty_response`, `.error_response`, `.has_data`, `.with_extensions` | no |
-| `gqlexec.null_lands_at`, `.runs_serially`, `.check_coverage`, `.subscription_gap` | no |
-| `gqlhttp.defaults`, `.post_only`, `.read_post`, `.read_get`, `.read_form` | no |
-| `gqlhttp.refuses_get_mutation`, `.allow_header`, `.reads_content_type` | no |
-| `gqlhttp.negotiate`, `.status_for`, `.status_for_fault`, `.content_type`, `.response_headers`, `.fault_body` | no |
-| `gqlhttp.looks_preflighted`, `.preflight_headers`, `.persisted_hash`, `.persisted_not_found` | no |
+Two resolvers are implemented in `tests/gqlexec_tests.nv`, one at
+`GqlResolver[]` and one at `GqlResolver[fs]`, and the same
+`gqlexec.execute` call is made against both: the test over the first
+declares `[io]` and the test over the second declares `[io, fs]`. The
+compiler decides that before the run starts — and the same call
+compiling at two rows is the package's central claim about its
+resolver trait.
 
 ## Licence
 

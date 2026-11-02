@@ -1,17 +1,6 @@
 // gqlexec_tests.nv — the resolver trait, and what its effect parameter
 // buys.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion that reaches this package fails with
-// `not implemented: graphql-nv.gqlexec.<fn>`.
-//
-// Three tests here pass today, and they are the ones that assert about
-// the RESOLVERS below rather than about the package: that the trait can
-// be implemented at two different effect rows, that its three methods
-// answer, and that a field context carries the schema name and the
-// alias separately.  Those are green because they are about the shape
-// the interface offers, which is what an interface release is for.
-//
 // **THE EFFECT ROWS ON THESE TESTS ARE THE ARGUMENT.**  Two resolvers
 // are implemented below: one that answers from a constant, declaring
 // `GqlResolver[]`, and one that reads a file, declaring

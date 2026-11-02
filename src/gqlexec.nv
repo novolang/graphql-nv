@@ -1,8 +1,6 @@
 // gqlexec.nv — § 6's execution, over one trait with an effect
 // parameter.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `GqlResolver[e]` IS THE LOAD-BEARING INTERFACE OF THIS PACKAGE, and
 // the shape it is NOT is the argument.
 //
@@ -60,7 +58,12 @@
 // is `gqlexec.subscribe` beside `execute`, with a `GqlResolver[e]`
 // that answers a stream, and nothing in this module's surface changes.
 
+use std.json
+use std.list
+use std.str
 use gqlerr
+use gqlcheck
+use gqlintro
 use gqllang
 use gqlsdl
 
@@ -178,6 +181,759 @@ pub struct GqlRequest
     // identifier arrives.
     extensions: Str
 
+// ── The walk ─────────────────────────────────────────────────────────
+
+// What a walk carries that is not the resolver.
+//
+// The resolver is NOT in here, and that is the reason this file has
+// one: a struct field would have to name its type, and the resolver's
+// type is a type parameter of every function that touches it.  So it
+// is threaded as an argument instead, which is also what keeps the
+// effect row honest — `[e]` is on the functions, not on a value.
+struct Walk
+    s: gqlsdl.GqlSchema
+    // The whole document, because a spread is resolved through the
+    // fragment table and not through the selection that named it.
+    d: gqllang.GqlDocument
+    // The COERCED variables, as a JSON object.
+    vars: Str
+    var errors: [gqlerr.GqlError]
+
+// A completed value, or the news that this level's null has to go up
+// one more.
+//
+// § 6.4.4 as a type.  A null where the type is nullable is a VALUE —
+// it stops there and the response carries it.  A null where the type
+// is NON-NULL is not a value at all: it is the message that whatever
+// contains this must be null, and the variant is what says so rather
+// than a convention about an empty string.
+enum Landed
+    LandedValue(value: json.JsonValueH)
+    LandedNull
+
+// One step of a response path, with the type it is against.
+struct Spot
+    name: Str
+    // False for a list index, which names no field and has no type of
+    // its own.
+    is_field: Bool
+    type_ref: gqllang.GqlTypeRef
+
+// The root type an operation executes against.
+//
+// A mutation with no mutation root is not executable, and validation
+// refuses one — this is the answer for the document that got past a
+// caller who skipped validation.
+fn root_type_of(s: gqlsdl.GqlSchema, k: gqllang.GqlOpKind) -> Str
+    match k
+        GqlQuery        => s.query_type
+        GqlMutation     => mutation_root(s)
+        // cov: skip — the subscription arm of `root_type_of`, which `execute` reaches only after refusing a subscription
+        GqlSubscription => subscription_root(s)
+
+fn mutation_root(s: gqlsdl.GqlSchema) -> Str
+    if str.len(s.mutation_type) > 0
+        return s.mutation_type
+    // cov: skip — the query-root fallback: validation refuses a mutation against a schema with no mutation root
+    s.query_type
+
+fn subscription_root(s: gqlsdl.GqlSchema) -> Str
+    // cov: skip — `subscription_root`, reachable only from the arm above
+    if str.len(s.subscription_type) > 0
+        return s.subscription_type
+    // cov: skip — and its own fallback is a second line no caller reaches, for the same reason the function is unreachable at all
+    s.query_type
+
+// JSON text as a value, with a JSON null where it does not parse.
+//
+// A resolver's failure is a `GqlFailed`; a resolver answering
+// something that is not JSON is a different thing, and it becomes a
+// null plus the ordinary "is not a value of" diagnostic rather than a
+// fault the client cannot see.
+fn parsed(text: Str) -> json.JsonValueH
+    match json.parse(text)
+        None    => json.null()
+        Some(v) => v
+
+fn quote_key(name: Str) -> Str
+    "\"" + name + "\""
+
+// The path with one response key under it.
+fn under(path: [Str], key: Str) -> [Str]
+    list.push(list.clone(path), key)
+
+// The path with one list index under it.
+fn under_index(path: [Str], i: Int) -> [Str]
+    list.push(list.clone(path), "${i}")
+
+fn is_index(seg: Str) -> Bool
+    var all = str.len(seg) > 0
+    var i = 0
+    while i < str.len(seg)
+        let b = str.byte_at(seg, i) ?? 0
+        if b < 48 or b > 57
+            all = false
+        i = i + 1
+    all
+
+// A field error, at a path and with nothing else.
+//
+// The path is filled in HERE and not by the resolver: a resolver does
+// not know where in the response it is, and should not have to.
+fn fail(var w: Walk, message: Str, path: [Str])
+    w.errors = list.push(w.errors, gqlerr.at_path(gqlerr.error(message), path))
+
+// `Type.field`, for a diagnostic about one.
+fn qualified(type_name: Str, field_name: Str) -> Str
+    type_name + "." + field_name
+
+// ── Types and values ─────────────────────────────────────────────────
+
+fn kind_of(s: gqlsdl.GqlSchema, name: Str) -> Str
+    match gqlsdl.type_named(s, name)
+        // cov: skip — `kind_of` is called for a type the schema declares
+        None    => ""
+        Some(t) => gqlintro.type_kind_name(t.kind)
+
+fn leaf_kind(s: gqlsdl.GqlSchema, name: Str) -> Bool
+    let k = kind_of(s, name)
+    k == "SCALAR" or k == "ENUM"
+
+fn is_builtin_scalar(name: Str) -> Bool
+    list.contains(gqlsdl.builtin_scalars(), name)
+
+fn enum_named(s: gqlsdl.GqlSchema, name: Str, value: Str) -> Bool
+    match gqlsdl.type_named(s, name)
+        // cov: skip — `enum_named` runs only after `kind_of` answered ENUM
+        None    => false
+        Some(t) => enum_has(t.enum_values, value)
+
+fn enum_has(values: [gqlsdl.GqlEnumValueDef], value: Str) -> Bool
+    var found = false
+    for v in values
+        if v.name == value
+            found = true
+    found
+
+// Whether a JSON value is a legal one for a built-in scalar.
+//
+// The output-coercion table of § 3.5, and the check that catches a
+// resolver answering a string where the schema says `Int` — which is a
+// deployment fault a client would otherwise see as a silently wrong
+// value.
+fn scalar_fits(name: Str, v: json.JsonValueH) -> Bool
+    let ty = json.type_of(v)
+    match name
+        "String"  => ty == "string"
+        "Boolean" => ty == "boolean"
+        "Float"   => ty == "number"
+        "Int"     => ty == "number" and not str.contains(json.stringify(v), ".")
+        "ID"      => ty == "string" or ty == "number" and not str.contains(json.stringify(v), ".")
+        _         =>
+            // cov: skip — `scalar_fits` is called only for a built-in scalar
+            true
+
+// ── Arguments ────────────────────────────────────────────────────────
+
+fn arg_node(args: [gqllang.GqlArgNode], name: Str) -> ?gqllang.GqlValueNode
+    var found: ?gqllang.GqlValueNode = None
+    for a in args
+        if found == None and a.name == name
+            found = Some(a.value)
+    found
+
+// A value as written, as JSON text, with the variables substituted.
+//
+// The one place a document's VALUES meet the request's variables, and
+// the reason a resolver never sees a `$`.
+fn value_json(v: gqllang.GqlValueNode, vars: Str) -> Str
+    match v.kind
+        "variable"        => variable_json(vars, v.text)
+        "string" | "enum" => json.stringify(json.string(v.text))
+        "list"            =>
+            var parts: [Str] = list.map(v.items, item => value_json(item, vars))
+            "[" + str.join(parts, ",") + "]"
+        "object"          =>
+            var parts: [Str] = []
+            for i in 0..list.len(v.names)
+                parts = list.push(parts, quote_key(list.get(v.names, i, "")) + ":"
+                    + value_json(list.get(v.items, i, v), vars))
+            "{" + str.join(parts, ",") + "}"
+        "null"            => "null"
+        _                 => v.text
+
+// A variable's value, as JSON text.  A name the request did not supply
+// is a JSON null, which is what § 6.1.2 coerced it to.
+fn variable_json(vars: Str, name: Str) -> Str
+    match json.parse(vars)
+        // cov: skip — `vars` is the coercion's own JSON, which parses
+        None      => "null"
+        Some(obj) =>
+            match json.get(obj, name)
+                Some(x) => json.stringify(x)
+                // cov: skip — the coercion holds every declared variable
+                None    => "null"
+
+// A value node as the plain text it names, for an argument that is a
+// NAME — `__type(name: "User")`.
+fn plain_text(v: gqllang.GqlValueNode, vars: Str) -> Str
+    if v.kind == "string" or v.kind == "enum"
+        return v.text
+    if v.kind == "variable"
+        return variable_text(vars, v.text)
+    // cov: skip — a `name` argument of another kind is refused by validation
+    ""
+
+// A variable's value as the plain text it names.
+//
+// THE MATCH IS THIS FUNCTION'S WHOLE BODY, and that is load-bearing: a
+// `match` in a statement position keeps no result, because each arm is
+// there for its effect.  Written in the caller above — a statement
+// `match` followed by a fall-through `""` — this answers the
+// fall-through for every variable, so `__type(name: $n)` answers null
+// whatever the request supplies.  0.20.2 diagnoses nothing.
+fn variable_text(vars: Str, name: Str) -> Str
+    match json.parse(vars)
+        // cov: skip — `vars` is the coercion's own JSON, which parses
+        None      => ""
+        Some(obj) =>
+            match json.get(obj, name)
+                Some(x) => json.to_str(x) ?? ""
+                // cov: skip — the coercion holds every declared variable
+                None    => ""
+
+fn truth_of(v: gqllang.GqlValueNode, vars: Str) -> Bool
+    if v.kind == "boolean"
+        return v.text == "true"
+    if v.kind == "variable"
+        return variable_truth(vars, v.text)
+    // cov: skip — a non-boolean directive argument is refused by validation
+    false
+
+// A variable's truth, out of the variables JSON.
+//
+// The match is the whole body for the reason `variable_text` gives: a
+// statement-position match drops its arms' values, so
+// `fields(includeDeprecated: $keep)` answered the fall-through `false`
+// and a query that asked for deprecated members got them dropped.
+fn variable_truth(vars: Str, name: Str) -> Bool
+    match json.parse(vars)
+        // cov: skip — `vars` is the coercion's own JSON, which parses
+        None      => false
+        Some(obj) =>
+            match json.get(obj, name)
+                Some(x) => json.to_bool(x) ?? false
+                // cov: skip — the coercion holds every declared variable
+                None    => false
+
+// The arguments of a field, coerced: every declared argument present,
+// with its default where the query did not pass one.
+//
+// Coerced BEFORE the resolver is called, which is what lets a resolver
+// read `ctx.args_json` rather than check it.  An argument the schema
+// does not declare never arrives — § 5.4.1 refused the query.
+fn args_of(w: Walk, f: gqlsdl.GqlFieldDef, sel: gqllang.GqlSelection) -> Str
+    var parts: [Str] = []
+    for a in f.args
+        match arg_node(sel.args, a.name)
+            Some(node) =>
+                parts = list.push(parts, quote_key(a.name) + ":"
+                                              + value_json(node, w.vars))
+            None       =>
+                match a.default_value
+                    Some(dv) =>
+                        parts = list.push(parts, quote_key(a.name) + ":"
+                                                  + value_json(dv, w.vars))
+                    None     =>
+                        parts = list.push(parts, quote_key(a.name) + ":null")
+    "{" + str.join(parts, ",") + "}"
+
+// ── Collecting a selection set ───────────────────────────────────────
+
+// Whether a type condition covers the type being walked.
+//
+// The type being walked is always CONCRETE — § 6.4.1 resolved the
+// abstract one before the fields were reached — so this is a subtype
+// question and not a "could be" one.
+fn applies(s: gqlsdl.GqlSchema, type_name: Str, condition: Str) -> Bool
+    if str.len(condition) == 0
+        return true
+    if condition == type_name
+        return true
+    gqlsdl.is_subtype(s, type_name, condition)
+
+// The selections of a set, with fragments expanded, in document order.
+//
+// `visited` holds the fragments already expanded into this set: a
+// second spread of one is skipped, as CollectFields requires, so the
+// cost is the size of the document and not the number of paths through
+// its fragments.
+fn flatten(var out: [gqllang.GqlSelection], var visited: [Str], w: Walk, type_name: Str,
+           sels: [gqllang.GqlSelection], path: [Str])
+    for sel in sels
+        if gqlcheck.selection_included(sel, w.vars)
+            match sel.kind
+                "field"  =>
+                    out = list.push(out, sel)
+                "spread" =>
+                    if not list.contains(visited, sel.name)
+                        visited = list.push(visited, sel.name)
+                        let fg = gqllang.fragment_of(w.d, sel.name)
+                        if let Some(f) = fg
+                            if applies(w.s, type_name, f.type_condition)
+                                flatten(var out, var visited, w, type_name, f.selections, path)
+                "inline" =>
+                    if applies(w.s, type_name, sel.type_condition)
+                        flatten(var out, var visited, w, type_name, sel.selections, path)
+                // cov: skip — unreachable from here: `gqllang` gives a selection one of the three kinds named above and no other, so the arm is the match's own completeness.
+                _        => ()
+
+fn replace_at(xs: [gqllang.GqlSelection], i: Int, v: gqllang.GqlSelection) -> [gqllang.GqlSelection]
+    var out: [gqllang.GqlSelection] = []
+    for k in 0..list.len(xs)
+        if k == i
+            out = list.push(out, v)
+        else
+            out = list.push(out, list.get(xs, k, v))
+    out
+
+// § 6.3.2: selections with the same RESPONSE KEY are one field.
+//
+// Grouped by the response key and not by the field name, which is the
+// whole of what an alias is: `{ a: name b: name }` is two fields and
+// `{ name name }` is one.
+fn merge_keys(flat: [gqllang.GqlSelection]) -> [gqllang.GqlSelection]
+    var out: [gqllang.GqlSelection] = []
+    for sel in flat
+        let key = gqllang.response_key(sel)
+        var at = -1
+        for i in 0..list.len(out)
+            if gqllang.response_key(list.get(out, i, sel)) == key
+                at = i
+        if at < 0
+            out = list.push(out, sel)
+        else
+            let prev = list.get(out, at, sel)
+            out = replace_at(out, at, GqlSelection { kind: prev.kind, name: prev.name,
+                                                     alias_name: prev.alias_name, args: prev.args,
+                                                     directives: prev.directives,
+                                                     type_condition: prev.type_condition,
+                                                     selections: list.concat(list.clone(prev.selections),
+                                                                             sel.selections),
+                                                     loc: prev.loc })
+    out
+
+fn collect_fields(w: Walk, type_name: Str, sels: [gqllang.GqlSelection],
+                  path: [Str]) -> [gqllang.GqlSelection]
+    var flat: [gqllang.GqlSelection] = []
+    var visited: [Str] = []
+    flatten(var flat, var visited, w, type_name, sels, path)
+    merge_keys(flat)
+
+// ── Completing a value ───────────────────────────────────────────────
+
+// A completed value at ONE level of its type: the named type at level
+// 0, the innermost list wrapper at 1, and so on outward, which is the
+// order `GqlTypeRef.non_null` is written in.
+fn complete<R: GqlResolver[e]>(var w: Walk, r: R, t: gqllang.GqlTypeRef, level: Int,
+                               sel: gqllang.GqlSelection, raw: json.JsonValueH,
+                               path: [Str]) -> Landed [e]
+    let required = list.get(t.non_null, level, false)
+    if level > 0
+        return complete_list(var w, r, t, level, sel, raw, path)
+    if json.is_null(raw)
+        if required
+            fail(var w, "`" + qualified(sel.name, "") + "` resolved to null and its type is `"
+                + gqllang.print_type(t) + "`",
+                path)
+            return LandedNull
+        return LandedValue(raw)
+    if leaf_kind(w.s, t.name)
+        return complete_leaf(var w, r, t, sel, raw, path)
+    let concrete = concrete_type(var w, r, t.name, raw, path)
+    if str.len(concrete) == 0
+        if required
+            return LandedNull
+        return LandedValue(json.null())
+    match exec_object(var w, r, concrete, raw, sel.selections, path)
+        LandedValue(v) => LandedValue(v)
+        LandedNull     => null_or_up(required)
+
+// A null at a level whose type is nullable is a VALUE; at a level
+// whose type is non-null it is the news that the level above must be
+// null too.
+fn null_or_up(required: Bool) -> Landed
+    if required
+        LandedNull
+    else
+        LandedValue(json.null())
+
+fn complete_list<R: GqlResolver[e]>(var w: Walk, r: R, t: gqllang.GqlTypeRef, level: Int,
+                                    sel: gqllang.GqlSelection, raw: json.JsonValueH,
+                                    path: [Str]) -> Landed [e]
+    let required = list.get(t.non_null, level, false)
+    match json.to_list(raw)
+        None        =>
+            if not json.is_null(raw)
+                fail(var w, json.stringify(raw) + " is not a list and the type is `"
+                    + gqllang.print_type(t) + "`",
+                    path)
+            if required
+                LandedNull
+            else
+                LandedValue(json.null())
+        Some(items) =>
+            var out: [json.JsonValueH] = []
+            var nulled = false
+            for i in 0..list.len(items)
+                match complete(var w, r, t, level - 1, sel, list.get(items, i, json.null()),
+                               under_index(path, i))
+                    LandedValue(v) =>
+                        out = list.push(out, v)
+                    LandedNull     =>
+                        nulled = true
+            if nulled
+                if required
+                    LandedNull
+                else
+                    LandedValue(json.null())
+            else
+                LandedValue(json.array(out))
+
+fn complete_leaf<R: GqlResolver[e]>(var w: Walk, r: R, t: gqllang.GqlTypeRef,
+                                    sel: gqllang.GqlSelection, raw: json.JsonValueH,
+                                    path: [Str]) -> Landed [e]
+    let required = list.get(t.non_null, 0, false)
+    if kind_of(w.s, t.name) == "ENUM"
+        if json.type_of(raw) == "string" and enum_named(w.s, t.name, json.to_str(raw) ?? "")
+            return LandedValue(raw)
+        return leaf_failure(var w, t, required, raw, path)
+    if is_builtin_scalar(t.name)
+        if scalar_fits(t.name, raw)
+            return LandedValue(raw)
+        return leaf_failure(var w, t, required, raw, path)
+    match r.gql_serialize_scalar(t.name, json.stringify(raw))
+        GqlValue(text) => LandedValue(parsed(text))
+        GqlNoResolver  => LandedValue(raw)
+        GqlFailed(err) =>
+            w.errors = list.push(w.errors, gqlerr.at_path(err, path))
+            if required
+                LandedNull
+            else
+                LandedValue(json.null())
+
+fn leaf_failure(var w: Walk, t: gqllang.GqlTypeRef, required: Bool, raw: json.JsonValueH,
+                path: [Str]) -> Landed
+    fail(var w, json.stringify(raw) + " is not a value of `" + gqllang.print_type(t) + "`", path)
+    if required
+        LandedNull
+    else
+        LandedValue(json.null())
+
+// The CONCRETE type of a value whose schema type is an interface or a
+// union (§ 6.4.1).
+//
+// Only the deployment knows which one this particular object is, and
+// an empty answer is a field error rather than a guess — a guess would
+// run the wrong fields, which is worse than failing.
+fn concrete_type<R: GqlResolver[e]>(var w: Walk, r: R, name: Str, raw: json.JsonValueH,
+                                    path: [Str]) -> Str [e]
+    let k = kind_of(w.s, name)
+    if k == "INTERFACE" or k == "UNION"
+        let answer = r.gql_type_of(name, json.stringify(raw))
+        if str.len(answer) == 0
+            fail(var w,
+                "the value of `" + name + "` has no concrete type, and only the deployment knows which one it is",
+                path)
+            return ""
+        return answer
+    name
+
+// One object's fields, in the order the query asked for them.
+fn exec_object<R: GqlResolver[e]>(var w: Walk, r: R, type_name: Str, parent: json.JsonValueH,
+                                  sels: [gqllang.GqlSelection], path: [Str]) -> Landed [e]
+    let picked = collect_fields(w, type_name, sels, path)
+    var kvs: [(Str, json.JsonValueH)] = []
+    var nulled = false
+    for sel in picked
+        let key = gqllang.response_key(sel)
+        let here = under(path, key)
+        var landed = LandedValue(json.null())
+        if gqlintro.is_meta_field(sel.name)
+            landed = meta_field_value(var w, sel, type_name, here)
+        else
+            match gqlsdl.field_named(w.s, type_name, sel.name)
+                None    =>
+                    fail(var w, "the field `" + sel.name + "` is not on `" + type_name + "`", here)
+                    landed = LandedValue(json.null())
+                Some(f) =>
+                    let raw = resolve_field(var w, r, type_name, parent, sel, f, here)
+                    landed = complete(var w, r, f.type_ref, f.type_ref.list_depth, sel, raw, here)
+        match landed
+            LandedValue(v) =>
+                kvs = list.push(kvs, (key, v))
+            LandedNull     =>
+                nulled = true
+    if nulled
+        return LandedNull
+    LandedValue(json.object(kvs))
+
+fn resolve_field<R: GqlResolver[e]>(var w: Walk, r: R, type_name: Str, parent: json.JsonValueH,
+                                    sel: gqllang.GqlSelection, f: gqlsdl.GqlFieldDef,
+                                    path: [Str]) -> json.JsonValueH [e]
+    let ctx = GqlFieldCtx { type_name: type_name, field_name: sel.name,
+                            response_key: gqllang.response_key(sel),
+                            parent_json: json.stringify(parent), args_json: args_of(w, f, sel),
+                            path: path, context: "" }
+    match r.gql_resolve(ctx)
+        GqlValue(text) => parsed(text)
+        GqlFailed(err) =>
+            w.errors = list.push(w.errors, gqlerr.at_path(err, path))
+            json.null()
+        GqlNoResolver  =>
+            fail(var w, "there is no resolver for `" + qualified(type_name, sel.name)
+                + "`, and the schema declares the field",
+                path)
+            json.null()
+
+// ── The meta-fields ──────────────────────────────────────────────────
+
+// The policy a snapshot is taken with: everything, deprecations
+// included.
+//
+// The filtering a query asks for is § 4.5's `includeDeprecated`
+// argument on `fields`, `enumValues`, `inputFields` and `args`, and it
+// is applied as the answer is projected — so a snapshot that had
+// already dropped the deprecated members would have nothing left to
+// include when a query asked.
+fn intro_snapshot() -> gqlintro.GqlIntroPolicy
+    GqlIntroPolicy { enabled: true, suggestions_off: true, include_deprecated: true }
+
+fn meta_field_value(var w: Walk, sel: gqllang.GqlSelection, type_name: Str, path: [Str]) -> Landed
+    if sel.name == "__typename"
+        return LandedValue(json.string(type_name))
+    if sel.name == "__schema"
+        match json.parse(gqlintro.schema_value(w.s, intro_snapshot()))
+            // cov: skip — `schema_value` answers JSON
+            None    => LandedValue(json.null())
+            Some(v) => project(var w, v, "__Schema", sel.selections, path)
+    elif sel.name == "__type"
+        let want = plain_text(arg_node_or(sel.args, "name"), w.vars)
+        if str.len(want) == 0
+            return LandedValue(json.null())
+        match gqlintro.type_value(w.s, intro_snapshot(), want)
+            None    => LandedValue(json.null())
+            Some(t) =>
+                match json.parse(t)
+                    // cov: skip — `type_value` answers the JSON of a type it found
+                    None    => LandedValue(json.null())
+                    Some(v) => project(var w, v, "__Type", sel.selections, path)
+    else
+        // cov: skip — `meta_field_value` is called only for the three meta fields
+        LandedValue(json.null())
+
+// A value node, or a JSON null node, for an argument that may be
+// absent.
+fn arg_node_or(args: [gqllang.GqlArgNode], name: Str) -> gqllang.GqlValueNode
+    match arg_node(args, name)
+        Some(v) => v
+        // cov: skip — a required argument that is absent is refused by validation
+        None    => gqllang.null_value()
+
+// ── Projecting a selection over JSON ─────────────────────────────────
+
+// The member names § 4.5 gives an `includeDeprecated` argument, and
+// therefore the four where an unasked-for deprecation is filtered out.
+fn deprecated_member(name: Str) -> Bool
+    name == "fields" or name == "enumValues" or name == "inputFields" or name == "args"
+
+fn includes_deprecated(sel: gqllang.GqlSelection, w: Walk) -> Bool
+    match arg_node(sel.args, "includeDeprecated")
+        Some(v) => truth_of(v, w.vars)
+        None    => gqlintro.defaults().include_deprecated
+
+fn drop_deprecated(v: json.JsonValueH) -> json.JsonValueH
+    match json.to_list(v)
+        None        => v
+        Some(items) =>
+            var out: [json.JsonValueH] = []
+            for x in items
+                if not (json.get_bool(x, "isDeprecated") ?? false)
+                    out = list.push(out, x)
+            json.array(out)
+
+// The `__Type` name an object's member holds.
+//
+// § 4.5's shapes are fixed, so the name of the type each member's
+// values are is a table rather than a guess — and it is what answers
+// `__typename` inside an introspection selection.
+fn member_typename(parent: Str, key: Str) -> Str
+    match parent
+        "__Schema"                      =>
+            if key == "types" or key == "queryType" or key == "mutationType" or key == "subscriptionType"
+                return "__Type"
+            if key == "directives"
+                return "__Directive"
+        "__Type"                        =>
+            if key == "fields"
+                return "__Field"
+            if key == "interfaces" or key == "possibleTypes" or key == "ofType"
+                return "__Type"
+            if key == "enumValues"
+                return "__EnumValue"
+            if key == "inputFields"
+                return "__InputValue"
+        "__Field"                       =>
+            if key == "args"
+                return "__InputValue"
+            if key == "type"
+                return "__Type"
+        "__InputValue" if key == "type" => "__Type"
+        "__Directive" if key == "args"  => "__InputValue"
+        _                               =>
+            // cov: skip — a selection on a member of another kind is refused by validation
+            ""
+
+// A selection set projected over a value that was computed rather than
+// resolved.
+//
+// The introspected document is JSON, not a resolver's answer, so it is
+// walked with the SAME selection machinery and none of the resolver
+// calls.  Aliases, fragments and `@skip` all work here because they
+// work everywhere.
+fn project(var w: Walk, v: json.JsonValueH, typename: Str, sels: [gqllang.GqlSelection],
+           path: [Str]) -> Landed
+    let picked = collect_fields(w, typename, sels, path)
+    var kvs: [(Str, json.JsonValueH)] = []
+    for sel in picked
+        let key = gqllang.response_key(sel)
+        var value = json.null()
+        match json.get(v, sel.name)
+            Some(m) =>
+                value = m
+            None    =>
+                value = json.null()
+        if list.len(sel.selections) > 0
+            var inside = value
+            if deprecated_member(sel.name) and not includes_deprecated(sel, w)
+                inside = drop_deprecated(value)
+            value = project_children(var w, inside, member_typename(typename, sel.name),
+                                     sel.selections, under(path, key))
+        kvs = list.push(kvs, (key, value))
+    LandedValue(json.object(kvs))
+
+fn project_children(var w: Walk, v: json.JsonValueH, typename: Str, sels: [gqllang.GqlSelection],
+                    path: [Str]) -> json.JsonValueH
+    match json.to_list(v)
+        Some(items) =>
+            var out: [json.JsonValueH] = []
+            for i in 0..list.len(items)
+                match project(var w, list.get(items, i, json.null()), typename, sels,
+                              under_index(path, i))
+                    LandedValue(x) =>
+                        out = list.push(out, x)
+                    LandedNull     =>
+                        // cov: skip — `project` answers `LandedValue` on every path
+                        out = list.push(out, json.null())
+            json.array(out)
+        None        =>
+            match project(var w, v, typename, sels, path)
+                LandedValue(x) => x
+                // cov: skip — `project` answers `LandedValue` on every path
+                LandedNull     => json.null()
+
+// ── Running a document ───────────────────────────────────────────────
+
+fn run_document<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang.GqlDocument, name: Str,
+                                   variables_json: Str,
+                                   root_json: Str) -> Result<GqlResponse, gqlerr.GqlFault> [e]
+    let op = gqllang.operation_of(d, name)!
+    match op.kind
+        GqlSubscription => Err(GqlUnsupported("subscription"))
+        GqlQuery        => run_validated(s, r, d, op, variables_json, root_json)
+        GqlMutation     => run_validated(s, r, d, op, variables_json, root_json)
+
+// A request's variables as the JSON object the coercion expects.
+//
+// `GqlRequest.variables` is EMPTY TEXT where a request carries none,
+// and empty text is not JSON — so the one place a request's text meets
+// the coercion is where "there are none" becomes `{}`.
+fn variables_text(j: Str) -> Str
+    if str.len(j) == 0
+        return "{}"
+    j
+
+// Written as one exit rather than a guard's `return`, because on this
+// toolchain an early return skips the release of a call-bound local
+// whose last use the tail moves into the answer — every verdict green
+// and `the run leaked`, exit 23, which is the shape gqlsdl's
+// `sdl_from_tokens` was measured with.
+// The guard can be a `return` again on a toolchain that releases the
+// local.
+fn run_validated<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang.GqlDocument,
+                                    op: gqllang.GqlOperation, variables_json: Str,
+                                    root_json: Str) -> Result<GqlResponse, gqlerr.GqlFault> [e]
+    let problems = gqlcheck.validate(s, d)
+    if list.len(problems) > 0
+        Err(GqlValidationFailed(problems))
+    else
+        let vars = gqlcheck.coerce_variables(s, op, variables_text(variables_json))!
+        Ok(run_operation(s, r, d, op, vars, root_json))
+
+fn run_operation<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang.GqlDocument,
+                                    op: gqllang.GqlOperation, vars: Str,
+                                    root_json: Str) -> GqlResponse [e]
+    var w = Walk { s: s, d: d, vars: vars, errors: [] }
+    var root_value = json.null()
+    match json.parse(root_json)
+        None    =>
+            root_value = json.object([])
+        Some(v) =>
+            root_value = v
+    match exec_object(var w, r, root_type_of(s, op.kind), root_value, op.selections, [])
+        LandedValue(v) => GqlResponse { data: json.stringify(v), errors: w.errors, extensions: "" }
+        LandedNull     => GqlResponse { data: "null", errors: w.errors, extensions: "" }
+
+// A list of errors as the JSON array § 7.1 puts under `errors`.
+fn errors_json(errors: [gqlerr.GqlError]) -> Str
+    var parts: [Str] = list.map(errors, e => gqlerr.error_json(e))
+    "[" + str.join(parts, ",") + "]"
+
+// The first `n` segments of a path.
+fn prefix(xs: [Str], n: Int) -> [Str]
+    list.take(xs, n)
+
+// A response path, with the type each field segment is against.
+//
+// One forward pass, because a propagation decision needs the types of
+// the segments BEFORE it and the decision itself is made backward.
+fn path_spots(s: gqlsdl.GqlSchema, root_type: Str, path: [Str]) -> [Spot]
+    var out: [Spot] = []
+    var level = root_type
+    for seg in path
+        if is_index(seg)
+            out = list.push(out, Spot { name: seg, is_field: false,
+                                        type_ref: gqllang.named_type("String") })
+        else
+            match gqlsdl.field_named(s, level, seg)
+                None    =>
+                    out = list.push(out, Spot { name: seg, is_field: false,
+                                                type_ref: gqllang.named_type("String") })
+                Some(f) =>
+                    out = list.push(out, Spot { name: seg, is_field: true,
+                                                type_ref: f.type_ref })
+                    level = f.type_ref.name
+    out
+
+// Whether a resolver answered a field at all.  `GqlFailed` is an
+// honest answer — the field failed — and `GqlNoResolver` is the one
+// that says the schema and the resolver disagree.
+fn answers(o: GqlOutcome) -> Bool
+    match o
+        GqlNoResolver => false
+        GqlValue(_)   => true
+        GqlFailed(_)  => true
+
 // ── Executing ────────────────────────────────────────────────────────
 
 // A whole request: parse, validate, coerce, execute.
@@ -227,7 +983,8 @@ pub struct GqlRequest
 // ```
 pub fn execute<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, req: GqlRequest, root_json: Str,
                                   lim: gqllang.GqlLimits) -> Result<GqlResponse, gqlerr.GqlFault> [e]
-    todo("graphql-nv.gqlexec.execute")
+    let d = gqllang.parse_executable(req.query, lim)!
+    run_document(s, r, d, req.operation_name, req.variables, root_json)
 
 // The same, on a document already parsed and validated.
 //
@@ -270,7 +1027,7 @@ pub fn execute<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, req: GqlRequest, ro
 pub fn execute_document<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang.GqlDocument,
                                            operation_name: Str, variables_json: Str,
                                            root_json: Str) -> Result<GqlResponse, gqlerr.GqlFault> [e]
-    todo("graphql-nv.gqlexec.execute_document")
+    run_document(s, r, d, operation_name, variables_json, root_json)
 
 // A request with only a document.
 //
@@ -281,7 +1038,7 @@ pub fn execute_document<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R, d: gqllang
 //     println(gqlexec.request("{ me }").query)
 // ```
 pub fn request(query: Str) -> GqlRequest []
-    todo("graphql-nv.gqlexec.request")
+    GqlRequest { query: query, operation_name: "", variables: "", extensions: "" }
 
 // The same request with variables.
 //
@@ -292,7 +1049,8 @@ pub fn request(query: Str) -> GqlRequest []
 //     println(gqlexec.with_variables(gqlexec.request("{ me }"), "{\"id\":1}").variables)
 // ```
 pub fn with_variables(req: GqlRequest, variables_json: Str) -> GqlRequest []
-    todo("graphql-nv.gqlexec.with_variables")
+    GqlRequest { query: req.query, operation_name: req.operation_name,
+                 variables: variables_json, extensions: req.extensions }
 
 // The same request naming an operation.
 //
@@ -303,7 +1061,8 @@ pub fn with_variables(req: GqlRequest, variables_json: Str) -> GqlRequest []
 //     println(gqlexec.with_operation(gqlexec.request("{ me }"), "Me").operation_name)
 // ```
 pub fn with_operation(req: GqlRequest, name: Str) -> GqlRequest []
-    todo("graphql-nv.gqlexec.with_operation")
+    GqlRequest { query: req.query, operation_name: name,
+                 variables: req.variables, extensions: req.extensions }
 
 // ── The response ─────────────────────────────────────────────────────
 
@@ -325,7 +1084,14 @@ pub fn with_operation(req: GqlRequest, name: Str) -> GqlRequest []
 //     println(gqlexec.response_json(gqlexec.empty_response()))
 // ```
 pub fn response_json(r: GqlResponse) -> Str []
-    todo("graphql-nv.gqlexec.response_json")
+    var parts: [Str] = []
+    if list.len(r.errors) > 0
+        parts = list.push(parts, "\"errors\":" + errors_json(r.errors))
+    if str.len(r.data) > 0
+        parts = list.push(parts, "\"data\":" + r.data)
+    if str.len(r.extensions) > 0
+        parts = list.push(parts, "\"extensions\":" + r.extensions)
+    "{" + str.join(parts, ",") + "}"
 
 // A response carrying nothing: no data, no errors.
 //
@@ -339,7 +1105,7 @@ pub fn response_json(r: GqlResponse) -> Str []
 //     println("${gqlexec.has_data(gqlexec.empty_response())}")
 // ```
 pub fn empty_response() -> GqlResponse []
-    todo("graphql-nv.gqlexec.empty_response")
+    GqlResponse { data: "", errors: [], extensions: "" }
 
 // A response carrying only errors, for a request that never executed.
 //
@@ -352,7 +1118,7 @@ pub fn empty_response() -> GqlResponse []
 //     println("${gqlexec.has_data(r)}")
 // ```
 pub fn error_response(errors: [gqlerr.GqlError]) -> GqlResponse []
-    todo("graphql-nv.gqlexec.error_response")
+    GqlResponse { data: "", errors: errors, extensions: "" }
 
 // Whether a response carries a `data` member at all.
 //
@@ -367,7 +1133,7 @@ pub fn error_response(errors: [gqlerr.GqlError]) -> GqlResponse []
 //     println("${gqlexec.has_data(gqlexec.empty_response())}")
 // ```
 pub fn has_data(r: GqlResponse) -> Bool []
-    todo("graphql-nv.gqlexec.has_data")
+    str.len(r.data) > 0
 
 // A response with `extensions` set, for timing or tracing.
 //
@@ -379,7 +1145,7 @@ pub fn has_data(r: GqlResponse) -> Bool []
 //     println(r.extensions)
 // ```
 pub fn with_extensions(r: GqlResponse, extensions_json: Str) -> GqlResponse []
-    todo("graphql-nv.gqlexec.with_extensions")
+    GqlResponse { data: r.data, errors: r.errors, extensions: extensions_json }
 
 // ── Null propagation ─────────────────────────────────────────────────
 
@@ -408,7 +1174,18 @@ pub fn with_extensions(r: GqlResponse, extensions_json: Str) -> GqlResponse []
 //         Ok(s)  => println("${list.len(gqlexec.null_lands_at(s, "Query", ["me"]))}")
 // ```
 pub fn null_lands_at(s: gqlsdl.GqlSchema, root_type: Str, path: [Str]) -> [Str] []
-    todo("graphql-nv.gqlexec.null_lands_at")
+    let spots = path_spots(s, root_type, path)
+    var i = list.len(spots)
+    var stop = -1
+    while i > 0 and stop < 0
+        i = i - 1
+        let spot = list.get(spots, i, Spot { name: "", is_field: false,
+                                             type_ref: gqllang.named_type("String") })
+        if spot.is_field and not gqllang.is_non_null(spot.type_ref)
+            stop = i
+    if stop < 0
+        return []
+    prefix(path, stop + 1)
 
 // Whether a mutation's top-level fields run in SERIAL (§ 6.3.1).
 //
@@ -427,7 +1204,10 @@ pub fn null_lands_at(s: gqlsdl.GqlSchema, root_type: Str, path: [Str]) -> [Str] 
 //     println("${gqlexec.runs_serially(gqllang.GqlMutation)}")
 // ```
 pub fn runs_serially(kind: gqllang.GqlOpKind) -> Bool []
-    todo("graphql-nv.gqlexec.runs_serially")
+    match kind
+        GqlQuery        => false
+        GqlMutation     => true
+        GqlSubscription => false
 
 // ── Coverage ─────────────────────────────────────────────────────────
 
@@ -467,7 +1247,16 @@ pub fn runs_serially(kind: gqllang.GqlOpKind) -> Bool []
 //         Ok(s)  => println("${list.len(gqlexec.check_coverage(s, a_resolver()))}")
 // ```
 pub fn check_coverage<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R) -> [Str] [e]
-    todo("graphql-nv.gqlexec.check_coverage")
+    var out: [Str] = []
+    for t in s.types
+        if kind_of(s, t.name) == "OBJECT"
+            for f in t.fields
+                let ctx = GqlFieldCtx { type_name: t.name, field_name: f.name,
+                                        response_key: f.name, parent_json: "{}",
+                                        args_json: "{}", path: [f.name], context: "" }
+                if not answers(r.gql_resolve(ctx))
+                    out = list.push(out, qualified(t.name, f.name))
+    out
 
 // ── The gap ──────────────────────────────────────────────────────────
 
@@ -487,4 +1276,6 @@ pub fn check_coverage<R: GqlResolver[e]>(s: gqlsdl.GqlSchema, r: R) -> [Str] [e]
 //     println(gqlexec.subscription_gap())
 // ```
 pub fn subscription_gap() -> Str []
-    todo("graphql-nv.gqlexec.subscription_gap")
+    "a subscription is not executed here: what is missing is the transport — the "
+        + "graphql-ws sub-protocol over a WebSocket — and not § 6.2.3's source event "
+        + "stream, which is a resolver that answers many values instead of one"

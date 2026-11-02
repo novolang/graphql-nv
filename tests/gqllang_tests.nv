@@ -1,9 +1,6 @@
 // gqllang_tests.nv — the query language, and the bounds a document
 // crosses.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqllang.<fn>`.
-//
 // THE LIMIT TESTS ARE THE ONES THAT MATTER.  A query language that
 // lets a client send a document of arbitrary depth is a denial of
 // service with a schema attached, and the two shapes below —
@@ -319,3 +316,363 @@ fn test_a_syntax_error_names_a_line_and_a_column() [io]
                     test.assert(line >= 1)
                     test.assert(col >= 1)
                 _                              => test.assert(false)
+
+// ── The lexer's own shapes ───────────────────────────────────────────
+//
+// Everything above reaches the lexer through a document.  What follows
+// reaches it through § 2.9's literal shapes, which is where a scanner
+// is either right or quietly wrong: an int that should have been a
+// float, an escape that survives as its own source, a block string
+// whose indentation was not taken off, and a column counted in bytes.
+
+fn value_shape(src: Str) -> Str
+    match gqllang.parse_value(src)
+        None    => "none"
+        Some(v) => v.kind + ":" + v.text
+
+fn type_shape(src: Str) -> Str
+    match gqllang.parse_type(src)
+        None    => "none"
+        Some(t) => gqllang.print_type(t)
+
+fn syntax_says(src: Str) -> Str
+    match gqllang.parse_executable(src, gqllang.default_limits())
+        Ok(_)  => "ok"
+        Err(f) =>
+            match f
+                GqlSyntaxError(msg, line, col) => msg + " @ ${line}:${col}"
+                _                              => "another fault"
+
+fn bound_says(src: Str, lim: gqllang.GqlLimits) -> Str
+    match gqllang.parse_executable(src, lim)
+        Ok(_)  => "ok"
+        Err(f) => f.message()
+
+fn printed(src: Str) -> Str
+    match a_document(src)
+        None    => "(refused)"
+        Some(d) => gqllang.print_document(d)
+
+@test
+fn test_a_number_is_an_int_unless_it_has_a_fraction_or_an_exponent() [io]
+    // § 2.9.1: the kind is a property of how the number is WRITTEN.
+    // A client that sends `1` where a Float is declared is asking for
+    // the Int-to-Float coercion, and a scanner that called it a float
+    // would answer a question the schema owns.
+    test.case("an int, with and without its sign")
+    test.assert_eq_str(value_shape("42"), "int:42")
+    test.assert_eq_str(value_shape("-3"), "int:-3")
+
+    test.case("a fraction makes it a float")
+    test.assert_eq_str(value_shape("1.5"), "float:1.5")
+
+    test.case("and so does an exponent, signed or not, upper or lower")
+    test.assert_eq_str(value_shape("1e3"), "float:1e3")
+    test.assert_eq_str(value_shape("1e+3"), "float:1e+3")
+    test.assert_eq_str(value_shape("2E-4"), "float:2E-4")
+
+@test
+fn test_what_the_lexer_refuses_it_refuses_at_the_offending_character() [io]
+    // The parser has no "unknown character" case, so a lexer that
+    // passed one through would report a grammar error at the wrong
+    // place — which is why an unknown character is a LEX fault.
+    test.case("§ 2.9.1's three shapes that are not a number")
+    test.assert_eq_str(syntax_says("{ f(x: 01) }"),
+                       "a number may not be written with a leading zero @ 1:8")
+    test.assert_eq_str(syntax_says("{ f(x: 1abc) }"),
+                       "a number may not be followed by a name or a dot @ 1:9")
+    test.assert_eq_str(syntax_says("{ f(x: 1.abc) }"),
+                       "a number may not be followed by a name or a dot @ 1:9")
+
+    test.case("and a character that can start no token at all")
+    test.assert_eq_str(syntax_says("{ me % }"),
+                       "a character that cannot start a token @ 1:6")
+
+    test.case("a comment is not a token, and runs to the end of the line")
+    test.assert_some(a_document("# nothing to see\n{ me } # nor here\n"))
+
+    test.case("nor are the commas and byte-order marks § 2.1 ignores")
+    test.assert_some(a_document("\u{feff}{, me,}"))
+
+    test.case("and a document of nothing but comments names no definition")
+    test.assert_eq_str(syntax_says("# nothing at all\n"),
+                       "a document needs at least one definition @ 1:1")
+
+@test
+fn test_a_string_token_holds_the_value_and_not_the_source() [io]
+    // Escapes are decoded at the lexer, so everything downstream reads
+    // the value the client meant rather than the source it wrote.
+    test.case("the eight escapes § 2.9.3 defines")
+    test.assert_eq_str(value_shape("\"a\\nb\""), "string:a\nb")
+    test.assert_eq_str(value_shape("\"a\\rb\""), "string:a\rb")
+    test.assert_eq_str(value_shape("\"a\\tb\""), "string:a\tb")
+    test.assert_eq_str(value_shape("\"a\\bb\""), "string:a\u{8}b")
+    test.assert_eq_str(value_shape("\"a\\fb\""), "string:a\u{c}b")
+    test.assert_eq_str(value_shape("\"a\\\"b\""), "string:a\"b")
+    test.assert_eq_str(value_shape("\"a\\\\b\""), "string:a\\b")
+    test.assert_eq_str(value_shape("\"a\\/b\""), "string:a/b")
+
+    test.case("a `\\u` escape, in either case of hex digit")
+    test.assert_eq_str(value_shape("\"\\u0041\""), "string:A")
+    test.assert_eq_str(value_shape("\"\\u00e9\""), "string:é")
+
+    test.case("a pair of escapes is ONE character outside the basic plane")
+    match gqllang.parse_value("\"\\uD83D\\uDE00\"")
+        None    => test.assert(false)
+        Some(v) =>
+            test.assert_eq_str(v.text, "\u{1f600}")
+            test.assert(list.len(str.chars(v.text)) == 1)
+
+    test.case("and half a pair is a code point UTF-8 cannot carry")
+    match gqllang.parse_value("\"\\uD83D\"")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(v.text, "\u{fffd}")
+
+    test.case("and so is a leading half followed by an escape that is not its trailing half")
+    match gqllang.parse_value("\"\\uD83D\\u0041\"")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(v.text, "\u{fffd}")
+
+    test.case("an escape GraphQL does not define, and a `\\u` short of four hex digits")
+    test.assert_eq_str(syntax_says("{ f(x: \"\\q\") }"),
+                       "an escape that GraphQL does not define @ 1:11")
+    test.assert_eq_str(syntax_says("{ f(x: \"\\uZZZZ\") }"),
+                       "a `\\u` escape needs four hex digits @ 1:11")
+    test.assert_eq_str(syntax_says("{ f(x: \"\\u12\") }"),
+                       "a `\\u` escape needs four hex digits @ 1:13")
+
+    test.case("a string that runs to the end of the document")
+    test.assert_eq_str(syntax_says("{ f(x: \"abc) }"),
+                       "a string that runs to the end of the document @ 1:15")
+
+    test.case("and one broken across two lines")
+    test.assert_eq_str(syntax_says("{ f(x: \"a\nb\") }"),
+                       "a line break inside a string @ 1:10")
+
+@test
+fn test_a_block_string_is_raw_and_its_indentation_comes_off() [io]
+    // § 2.9.4: the lines the delimiters sit on do not survive and the
+    // common indentation is removed — which is what makes a block
+    // string usable for a query embedded in source.
+    test.case("an indented block")
+    test.assert_eq_str(value_shape("\"\"\"\n  hello\n    world\n  \"\"\""),
+                       "string:hello\n  world")
+
+    test.case("`\\\"\"\"` is the one thing a block string escapes")
+    test.assert_eq_str(value_shape("\"\"\"a \\\"\"\" b\"\"\""), "string:a \"\"\" b")
+
+    test.case("a block of blank lines has no indentation to take off")
+    test.assert_eq_str(value_shape("\"\"\"\n\n\"\"\""), "string:")
+
+    test.case("and one that never closes runs to the end of the document")
+    test.assert_eq_str(syntax_says("{ f(x: \"\"\"abc) }"),
+                       "a block string that runs to the end of the document @ 1:17")
+
+@test
+fn test_a_column_is_counted_in_characters_and_not_in_bytes() [io]
+    // A column measured in bytes points into the middle of a name as
+    // soon as somebody uses one — and the fault is one character
+    // further on than a byte-counting scanner would say.
+    test.case("a multi-byte character before the fault")
+    test.assert_eq_str(syntax_says("{ f(x: \"éé\" 4) }"),
+                       "expected an argument name @ 1:13")
+
+// ── Printing back ────────────────────────────────────────────────────
+
+@test
+fn test_a_document_prints_back_with_every_head_and_selection_written() [io]
+    // The printed form is what a persisted-query deployment hashes, so
+    // it is a canonical form and not a formatter: whitespace does not
+    // survive and the text parses back to the same document.
+    test.case("a head with variables, defaults and directives, and every kind of selection")
+    let source = "query Q(\$x: Int = 3 @d) @op { a: me(n: 1, s: \"t\", l: [1, 2],"
+        + " o: {k: \$x}) @dir ...F ... on T { f } ... @dir2 { g } }"
+        + " fragment F on Q { me }"
+    let want = "query Q (\$x: Int = 3@d) @op {\n"
+        + "  a: me(n: 1, s: \"t\", l: [1, 2], o: {k: \$x})@dir\n"
+        + "  ...F\n"
+        + "  ... on T {\n"
+        + "    f\n"
+        + "  }\n"
+        + "  ...@dir2 {\n"
+        + "    g\n"
+        + "  }\n"
+        + "}\n"
+        + "\n"
+        + "fragment F on Q {\n"
+        + "  me\n"
+        + "}"
+    test.assert_eq_str(printed(source), want)
+
+    test.case("and the printed text parses back to the same text")
+    test.assert_eq_str(printed(want), want)
+
+    test.case("the three keywords, and each head that carries no keyword")
+    test.assert_eq_str(printed("mutation M { bump }"), "mutation M {\n  bump\n}")
+    test.assert_eq_str(printed("subscription S { ticks }"), "subscription S {\n  ticks\n}")
+    test.assert_eq_str(printed("mutation { bump }"), "mutation {\n  bump\n}")
+    test.assert_eq_str(printed("query @dir { me }"), "query @dir {\n  me\n}")
+    test.assert_eq_str(printed("{ me }"), "{\n  me\n}")
+
+    test.case("and an empty selection set, which § 5.2.2 refuses and § 2.3 parses")
+    test.assert_eq_str(printed("{ }"), "{}")
+
+    test.case("a string is quoted back with the escapes § 2.9.3 defines")
+    match gqllang.parse_value("\"a\\\"b\\\\c\\u0001\"")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(gqllang.print_value(v), "\"a\\\"b\\\\c\\u0001\"")
+    match gqllang.parse_value("\"\\r\\t\\b\\f\"")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(gqllang.print_value(v), "\"\\r\\t\\b\\f\"")
+
+    test.case("a control character with no escape of its own is written as `\\uXXXX`")
+    match gqllang.parse_value("\"\u{1f}\"")
+        None    => test.assert(false)
+        Some(v) => test.assert_eq_str(gqllang.print_value(v), "\"\\u001f\"")
+
+// ── Everything the grammar refuses ───────────────────────────────────
+
+@test
+fn test_each_measured_bound_refuses_with_its_own_measurement_named() [io]
+    // A deployment tuning a limit needs to know which one bit, so the
+    // fault names the measurement and both numbers rather than saying
+    // "too large".
+    test.case("breadth")
+    test.assert_eq_str(bound_says("{ a b c }", gqllang.limits(0, 2, 0, 0, 0)),
+                       "the document exceeds the breadth bound: 3 against a ceiling of 2")
+
+    test.case("aliases")
+    test.assert_eq_str(bound_says("{ a: me b: me }", gqllang.limits(0, 0, 0, 1, 0)),
+                       "the document exceeds the aliases bound: 2 against a ceiling of 1")
+
+    test.case("spreads")
+    test.assert_eq_str(bound_says("{ ...A ...B }", gqllang.limits(0, 0, 0, 0, 1)),
+                       "the document exceeds the spreads bound: 2 against a ceiling of 1")
+
+    test.case("bytes, which is checked before anything is lexed")
+    test.assert_eq_str(bound_says("{ me }", gqllang.limits(0, 0, 5, 0, 0)),
+                       "the document exceeds the bytes bound: 6 against a ceiling of 5")
+
+    test.case("and a document inside every bound is not refused")
+    test.assert_eq_str(bound_says("{ a b c }", gqllang.limits(0, 3, 0, 0, 0)), "ok")
+
+@test
+fn test_a_standalone_value_or_type_is_read_whole_or_refused() [io]
+    // Both are published readers — a diagnostic quotes a value and an
+    // SDL default is written with one — and both answer None rather
+    // than a fault, and refuse a LEX error and a token left over: so
+    // `Int Extra` is not "Int".
+    test.case("a value")
+    test.assert_eq_str(value_shape("%"), "none")
+    test.assert_eq_str(value_shape("1 2"), "none")
+    test.assert_eq_str(value_shape("{}"), "object:")
+
+    test.case("a type")
+    test.assert_eq_str(type_shape("User"), "User")
+    test.assert_eq_str(type_shape("[[User!]!]!"), "[[User!]!]!")
+    test.assert_eq_str(type_shape("%"), "none")
+    test.assert_eq_str(type_shape("Int Extra"), "none")
+    test.assert_eq_str(type_shape("[Int"), "none")
+
+    test.case("and a named type is a type with no wrapper to unwrap")
+    test.assert_eq_str(gqllang.print_type(gqllang.inner_type(gqllang.named_type("User"))),
+                       "User")
+
+@test
+fn test_a_grammar_fault_names_what_was_wanted_and_where() [io]
+    // One fault per document, at the token that caused it: the parser
+    // keeps reading after a fault so that one mistake is one message.
+    test.case("a definition that is neither an operation nor a fragment")
+    test.assert_eq_str(syntax_says("42"),
+                       "expected an operation or a fragment definition @ 1:1")
+    test.assert_eq_str(syntax_says("{ me } whatever"),
+                       "expected an operation or a fragment definition @ 1:8")
+
+    test.case("an operation with no selection set")
+    test.assert_eq_str(syntax_says("query Q"),
+                       "an operation needs a selection set @ 1:8")
+
+    test.case("variable definitions")
+    test.assert_eq_str(syntax_says("query (\$x: Int"),
+                       "unterminated variable definitions @ 1:15")
+    test.assert_eq_str(syntax_says("query (x: Int) { me }"),
+                       "expected `\$` before a variable name @ 1:8")
+
+    test.case("an argument list")
+    test.assert_eq_str(syntax_says("{ f(x: 1"),
+                       "unterminated argument list @ 1:9")
+    test.assert_eq_str(syntax_says("{ f(x 1) }"),
+                       "expected `:` after the argument name @ 1:7")
+    test.assert_eq_str(syntax_says("{ f(1) }"),
+                       "expected an argument name @ 1:5")
+
+    test.case("and one mistake is one message, whichever way the parse goes on")
+    test.assert_eq_str(syntax_says("{ f(x { y } }"),
+                       "expected `:` after the argument name @ 1:7")
+
+    test.case("a selection that is not a selection")
+    test.assert_eq_str(syntax_says("{ 42 }"), "expected a field name @ 1:3")
+
+    test.case("spreads and fragments")
+    test.assert_eq_str(syntax_says("{ ... on T }"),
+                       "an inline fragment needs a selection set @ 1:12")
+    test.assert_eq_str(syntax_says("fragment F on Q"),
+                       "a fragment needs a selection set @ 1:16")
+    test.assert_eq_str(syntax_says("fragment on User { me }"),
+                       "a fragment cannot be named `on` @ 1:10")
+    test.assert_eq_str(syntax_says("fragment on { me }"),
+                       "a fragment cannot be named `on` @ 1:10")
+
+    test.case("values")
+    test.assert_eq_str(syntax_says("{ f(x: ) }"), "expected a value @ 1:8")
+    test.assert_eq_str(syntax_says("{ f(x: [1,"),
+                       "a list value that runs to the end of the document @ 1:11")
+    test.assert_eq_str(syntax_says("{ f(x: {a: 1"),
+                       "an object value that runs to the end of the document @ 1:13")
+    test.assert_eq_str(syntax_says("{ f(x: {a 1}) }"),
+                       "expected `:` after an object field name @ 1:11")
+
+// ── Measuring a document with fragments ──────────────────────────────
+
+@test
+fn test_a_measurement_over_fragments_expands_them_once_and_terminates_on_a_cycle() [io]
+    // Fragments are where a measurement goes wrong.  A fragment spread
+    // from an operation is counted where the operation spreads it, and
+    // NOT again in its own definition — that answered twice for one
+    // written field.  A fragment no operation spreads is still
+    // measured, and a spread that is followed forever answers 0 rather
+    // than diving.
+    test.case("depth: a fragment is measured even when nothing spreads it")
+    match a_document("query Q { ...A } fragment A on Q { x } fragment Deep on Q { a { b { c } } }")
+        None    => test.assert(false)
+        Some(d) => test.assert(gqllang.depth_of(d) == 3)
+
+    test.case("fields: one field written in a fragment is one field, spread or not")
+    match a_document("query Q { ...A a: me } fragment A on Q { b: me }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(gqllang.field_count(d) == 2)
+            test.assert(gqllang.alias_count(d) == 2)
+
+    test.case("a spread, an inline fragment, and a spread that is not there")
+    match a_document("{ ...A ... on Q { q } ...Nope } fragment A on Q { a { b } }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(gqllang.depth_of(d) == 2)
+            test.assert(gqllang.field_count(d) == 3)
+            test.assert(gqllang.alias_count(d) == 0)
+
+    test.case("a cycle terminates rather than diving")
+    match a_document("query Q { ...C } fragment C on Q { ...C }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(gqllang.depth_of(d) == 0)
+            test.assert(gqllang.field_count(d) == 0)
+
+    test.case("and a document of fragments alone is measured through its fragments")
+    match a_document("fragment A on Q { b: me c: me }")
+        None    => test.assert(false)
+        Some(d) =>
+            test.assert(gqllang.alias_count(d) == 2)
+            test.assert(gqllang.field_count(d) == 2)
+            test.assert(gqllang.depth_of(d) == 1)

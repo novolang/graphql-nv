@@ -1,9 +1,6 @@
 // gqlintro_tests.nv — introspection, and the decision to turn it off
 // that is usually argued badly.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqlintro.<fn>`.
-//
 // The interesting assertion in this file is that `__typename` answers
 // even with introspection off: it is available on every composite,
 // a client uses it to decide which fragment matched, and a server that
@@ -18,6 +15,14 @@ use gqlsdl
 
 fn a_schema() -> gqlsdl.GqlSchema
     match gqlsdl.build("type Query { me: String viewer: String }")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+fn a_schema_with_every_root() -> gqlsdl.GqlSchema
+    match gqlsdl.build("type Query { me: String } type Mutation { bump: Int } "
+                       + "type Subscription { tick: Int }")
         Ok(s)  => s
         Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
                               mutation_type: "", subscription_type: "",
@@ -105,6 +110,18 @@ fn test_a_schema_comes_back_out_of_an_introspection_document() [io]
     match gqlintro.schema_of(gqlintro.document(a_schema()))
         Err(_) => test.assert(false)
         Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+    test.case("and every root comes back, not only the query one")
+    // § 4.5 spells a root type `__Type`, so `mutationType` is
+    // `{"name": "Mutation"}`.  Written as the bare name it reads back
+    // as no root at all, and a federated gateway loses every mutation
+    // the service has.
+    match gqlintro.schema_of(gqlintro.document(a_schema_with_every_root()))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert_eq_str(s.query_type, "Query")
+            test.assert_eq_str(s.mutation_type, "Mutation")
+            test.assert_eq_str(s.subscription_type, "Subscription")
 
     test.case("and a document that is not one is refused with what is missing named")
     match gqlintro.schema_of("{}")

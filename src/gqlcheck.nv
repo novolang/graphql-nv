@@ -1,8 +1,6 @@
 // gqlcheck.nv — § 5's validation rules, by name, against a schema.
 // `[]`.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // VALIDATION CANNOT FAIL.  `validate` answers a LIST of errors, never
 // a `Result`: a document that does not satisfy the schema is the
 // ANSWER — a 400 whose body is the list — and modelling it as an error
@@ -38,9 +36,790 @@
 // values a deployment accepts.  `gqlexec.GqlResolver` is where a custom
 // scalar's coercion belongs.
 
+use std.json
+use std.list
+use std.str
 use gqlerr
 use gqllang
 use gqlsdl
+
+// ── The rules, by name ───────────────────────────────────────────────
+
+// One rule: the specification's own sentence for it, and the section
+// it comes from.
+struct RuleRow
+    name: Str
+    section: Str
+
+// The twenty-two rules, in the order § 5 lists them.
+//
+// One table rather than two: `rule_names` and `rule_section` reading
+// different lists is how a name comes to have no section.
+fn rule_table() -> [RuleRow]
+    [RuleRow { name: "Operation names must be unique", section: "5.2.1.1" },
+     RuleRow { name: "An anonymous operation must be the only operation", section: "5.2.2.1" },
+     RuleRow { name: "A subscription must have exactly one root field", section: "5.2.3.1" },
+     RuleRow { name: "Field selections must exist on the type", section: "5.3.1" },
+     RuleRow { name: "Selections under one response key must merge", section: "5.3.2" },
+     RuleRow { name: "Composite fields must have a selection set", section: "5.3.3" },
+     RuleRow { name: "Leaf fields must not have a selection set", section: "5.3.3" },
+     RuleRow { name: "Arguments must be defined on the field", section: "5.4.1" },
+     RuleRow { name: "Arguments must be unique", section: "5.4.2" },
+     RuleRow { name: "Required arguments must be supplied", section: "5.4.3" },
+     RuleRow { name: "Fragment names must be unique", section: "5.5.1.1" },
+     RuleRow { name: "Fragments must be used", section: "5.5.1.4" },
+     RuleRow { name: "A fragment spread must name a fragment that exists", section: "5.5.2.1" },
+     RuleRow { name: "Fragment spreads must not form cycles", section: "5.5.2.2" },
+     RuleRow { name: "A fragment spread must be possible", section: "5.5.2.3" },
+     RuleRow { name: "Values must fit the type they are written for", section: "5.6.1" },
+     RuleRow { name: "Input object fields must be unique", section: "5.6.3" },
+     RuleRow { name: "Directives must be defined", section: "5.7.1" },
+     RuleRow { name: "Directives must be in a valid location", section: "5.7.2" },
+     RuleRow { name: "Directives must be unique at one location", section: "5.7.3" },
+     RuleRow { name: "Variables must be declared before they are used", section: "5.8.3" },
+     RuleRow { name: "Every declared variable must be used", section: "5.8.4" }]
+
+// ── The walk ─────────────────────────────────────────────────────────
+
+// One validation run: the schema, the rules that are switched on, and
+// the errors found so far.
+//
+// The rules are a SET of the names in `rule_table`, which is what makes
+// `validate_only` and `validate_except` one flag check each rather than
+// a second validator.  A rule that is off does not run its check; the
+// walk that would have reached it still happens, because another rule
+// may need the same traversal.
+struct Check
+    s: gqlsdl.GqlSchema
+    d: gqllang.GqlDocument
+    enabled: [Str]
+    var out: [gqlerr.GqlError]
+
+fn on(c: Check, rule: Str) -> Bool
+    list.contains(c.enabled, rule)
+
+fn add(var c: Check, msg: Str, spot: gqlerr.GqlLoc)
+    c.out = list.push(c.out, gqlerr.at(gqlerr.error(msg), spot.line, spot.column))
+
+// The document's own name for an operation kind, which is also the
+// word § 5.2's rules are written with.
+fn op_word(k: gqllang.GqlOpKind) -> Str
+    match k
+        GqlQuery        => "query"
+        GqlMutation     => "mutation"
+        GqlSubscription => "subscription"
+
+// The type an operation's top-level selections are against.
+// The § 3.13 spelling of an operation's own location, which is NOT
+// `op_word`: a schema writes its directive's locations in the
+// specification's uppercase words — `directive @d on QUERY` — so the
+// word a rule compares is that one.  A lowercase word here compares
+// `QUERY` against `query`, which answers "no" every time, and every
+// custom directive on an operation is refused as being in the wrong
+// place.  A diagnostic still says "query" (`op_word`) or "query
+// operation" (`location_words`).
+fn op_location(k: gqllang.GqlOpKind) -> Str
+    match k
+        GqlQuery        => "QUERY"
+        GqlMutation     => "MUTATION"
+        GqlSubscription => "SUBSCRIPTION"
+
+fn root_type(s: gqlsdl.GqlSchema, k: gqllang.GqlOpKind) -> Str
+    let word = op_word(k)
+    if word == "mutation"
+        return s.mutation_type
+    if word == "subscription"
+        return s.subscription_type
+    s.query_type
+
+fn find_arg_def(args: [gqllang.GqlArgDef], name: Str) -> ?gqllang.GqlArgDef
+    var found: ?gqllang.GqlArgDef = None
+    for a in args
+        if found == None and a.name == name
+            found = Some(a)
+    found
+
+fn find_input_field(fields: [gqlsdl.GqlArgDef], name: Str) -> ?gqlsdl.GqlArgDef
+    var found: ?gqlsdl.GqlArgDef = None
+    for a in fields
+        if found == None and a.name == name
+            found = Some(a)
+    found
+
+fn find_directive_def(s: gqlsdl.GqlSchema, name: Str) -> ?gqlsdl.GqlDirectiveDef
+    var found: ?gqlsdl.GqlDirectiveDef = None
+    for d in s.directives
+        if found == None and d.name == name
+            found = Some(d)
+    found
+
+fn find_fragment(d: gqllang.GqlDocument, name: Str) -> ?gqllang.GqlFragment
+    var found: ?gqllang.GqlFragment = None
+    for f in d.fragments
+        if found == None and f.name == name
+            found = Some(f)
+    found
+
+// ── Values ───────────────────────────────────────────────────────────
+
+// Whether a value AS WRITTEN fits a type.
+//
+// The typed walk is the outer list levels first: `depth` counts the
+// list wrappers still to cross and `markers` is the type's non-null
+// list, innermost first, so the marker for the level being checked is
+// `markers[depth]`.
+fn lit_fits(s: gqlsdl.GqlSchema, v: gqllang.GqlValueNode, name: Str, depth: Int,
+            markers: [Bool]) -> Bool
+    let required = list.get(markers, depth, false)
+    if v.kind == "null"
+        return not required
+    if v.kind == "variable"
+        // § 5.8.5 — the variable's declared type against this location's
+        // — is not one of the rules this package implements; see
+        // `unchecked_rules`.
+        return true
+    if depth > 0
+        return lit_list_fits(s, v, name, depth, markers)
+    if v.kind == "list"
+        return false
+    lit_named_fits(s, v, name)
+
+fn lit_list_fits(s: gqlsdl.GqlSchema, v: gqllang.GqlValueNode, name: Str, depth: Int,
+                 markers: [Bool]) -> Bool
+    if v.kind != "list"
+        return false
+    var ok = true
+    for item in v.items
+        if not lit_fits(s, item, name, depth - 1, markers)
+            ok = false
+    ok
+
+fn lit_named_fits(s: gqlsdl.GqlSchema, v: gqllang.GqlValueNode, name: Str) -> Bool
+    match name
+        "Int"     => v.kind == "int"
+        "Float"   => v.kind == "int" or v.kind == "float"
+        "String"  => v.kind == "string"
+        "Boolean" => v.kind == "boolean"
+        "ID"      => v.kind == "string" or v.kind == "int"
+        _         =>
+            match gqlsdl.type_named(s, name)
+                // cov: skip — unreachable from here: every name this is handed is an argument's or an input field's declared type, out of a schema `gqlsdl.build` accepted, and `build_from` refuses a reference to a type the document does not define — so `type_named` answers every time.  The arm is the match's own completeness.
+                None    => false
+                Some(t) =>
+                    if list.len(t.enum_values) > 0
+                        v.kind == "enum" and find_enum_name(t.enum_values, v.text)
+                    elif list.len(t.input_fields) > 0
+                        v.kind == "object" and input_object_fits(s, t, v)
+                    else
+                        // A custom scalar: whether `"2026-13-45"` is a valid
+                        // `Date` is the scalar's own question.
+                        true
+
+fn find_enum_name(values: [gqlsdl.GqlEnumValueDef], name: Str) -> Bool
+    var found = false
+    for v in values
+        if v.name == name
+            found = true
+    found
+
+// An input object's members, against its type: every named field
+// exists, every one fits, and every required one is there (§ 5.6.1,
+// § 5.6.2, § 5.6.4 — one rule, because "the value fits the type" is
+// what all three decide).
+fn input_object_fits(s: gqlsdl.GqlSchema, t: gqlsdl.GqlTypeDef, v: gqllang.GqlValueNode) -> Bool
+    var ok = true
+    for k in 0..list.len(v.names)
+        let fname = list.get(v.names, k, "")
+        let value = list.get(v.items, k, v)
+        match find_input_field(t.input_fields, fname)
+            None    =>
+                ok = false
+            Some(f) =>
+                if not lit_fits(s, value, f.type_ref.name, f.type_ref.list_depth, f.type_ref.non_null)
+                    ok = false
+    for f in t.input_fields
+        if gqllang.is_non_null(f.type_ref) and f.default_value == None and not list.contains(v.names, f.name)
+            ok = false
+    ok
+
+// Whether an input object value names one field twice (§ 5.6.3).
+fn duplicate_member_names(v: gqllang.GqlValueNode) -> [Str]
+    var out: [Str] = []
+    var seen: [Str] = []
+    for n in v.names
+        if list.contains(seen, n)
+            out = list.push(out, n)
+        else
+            seen = list.push(seen, n)
+    out
+
+// ── Variables, as JSON ───────────────────────────────────────────────
+
+// A JSON number that is written as an integer.
+//
+// `json.to_int` answers the truncation of `1.5`, so it cannot tell the
+// two apart; the compact form can, and `1.0` is a float for an `Int`
+// exactly as § 2.9.1's grammar says it is.
+fn json_is_int(v: json.JsonValueH) -> Bool
+    json.type_of(v) == "number" and not str.contains(json.stringify(v), ".")
+
+fn json_is_number(v: json.JsonValueH) -> Bool
+    json.type_of(v) == "number"
+
+fn json_fits(s: gqlsdl.GqlSchema, v: json.JsonValueH, name: Str, depth: Int,
+             markers: [Bool]) -> Bool
+    let required = list.get(markers, depth, false)
+    if json.is_null(v)
+        return not required
+    if depth > 0
+        return json_list_fits(s, v, name, depth, markers)
+    json_named_fits(s, v, name)
+
+fn json_list_fits(s: gqlsdl.GqlSchema, v: json.JsonValueH, name: Str, depth: Int,
+                  markers: [Bool]) -> Bool
+    match json.to_list(v)
+        None     => false
+        Some(xs) =>
+            var ok = true
+            for item in xs
+                if not json_fits(s, item, name, depth - 1, markers)
+                    ok = false
+            ok
+
+fn json_named_fits(s: gqlsdl.GqlSchema, v: json.JsonValueH, name: Str) -> Bool
+    match name
+        "Int"     => json_is_int(v)
+        "Float"   => json_is_number(v)
+        "String"  => json.type_of(v) == "string"
+        "Boolean" => json.type_of(v) == "boolean"
+        "ID"      => json.type_of(v) == "string" or json_is_int(v)
+        _         =>
+            match gqlsdl.type_named(s, name)
+                None    => false
+                Some(t) =>
+                    if list.len(t.enum_values) > 0
+                        json.type_of(v) == "string" and str_enum_ok(t.enum_values, v)
+                    elif list.len(t.input_fields) > 0
+                        json.type_of(v) == "object"
+                    else
+                        true
+
+// A JSON string as an enum value: the string's own text.
+fn str_enum_ok(values: [gqlsdl.GqlEnumValueDef], v: json.JsonValueH) -> Bool
+    match json.to_str(v)
+        // cov: skip — unreachable from here: the only caller reaches this after `json.type_of(v) == "string"`, and a JSON string always reads back as one, so the arm is the match's completeness rather than a shape a request can send.
+        None    => false
+        Some(s) => find_enum_name(values, s)
+
+// ── Selection sets, one level at a time ──────────────────────────────
+
+// A selection set, with the type its selections are against.
+fn check_selection_set(var c: Check, parent: Str, sels: [gqllang.GqlSelection])
+    for sel in sels
+        match sel.kind
+            "field"  => check_field(var c, parent, sel)
+            "inline" =>
+                check_directives_on(var c, sel.directives, "INLINE_FRAGMENT", sel.loc)
+                check_condition(var c, parent, sel.type_condition, sel.loc)
+                check_selection_set(var c, condition_or(parent, sel.type_condition), sel.selections)
+            "spread" =>
+                check_directives_on(var c, sel.directives, "FRAGMENT_SPREAD", sel.loc)
+                check_spread(var c, parent, sel)
+            // cov: skip — unreachable from here: `gqllang` gives a selection one of the three kinds named above and no other, so the arm is the match's own completeness.
+            _        => ()
+    check_merge_set(var c, parent, sels)
+
+// The type a selection set's selections are against after a fragment's
+// type condition, which is the condition where there is one.
+fn condition_or(parent: Str, cond: Str) -> Str
+    if str.len(cond) == 0
+        return parent
+    cond
+
+// One field selection.
+fn check_field(var c: Check, parent: Str, sel: gqllang.GqlSelection)
+    check_directives_on(var c, sel.directives, "FIELD", sel.loc)
+    for a in sel.args
+        check_value_objects(var c, a.value)
+    match gqlsdl.field_named(c.s, parent, sel.name)
+        None    =>
+            if on(c, "Field selections must exist on the type")
+                add(var c, "the field `" + sel.name + "` does not exist on `" + parent + "`", sel.loc)
+        Some(f) => check_known_field(var c, parent, sel, f)
+
+fn check_known_field(var c: Check, parent: Str, sel: gqllang.GqlSelection, f: gqlsdl.GqlFieldDef)
+    var seen: [Str] = []
+    for a in sel.args
+        if list.contains(seen, a.name) and on(c, "Arguments must be unique")
+            add(var c, "the field `" + sel.name + "` is given `" + a.name + "` twice", a.loc)
+        seen = list.push(seen, a.name)
+        match find_arg_def(f.args, a.name)
+            None    =>
+                if on(c, "Arguments must be defined on the field")
+                    add(var c,
+                        "the field `" + sel.name + "` on `" + parent + "` takes no argument `" + a.name + "`",
+                        a.loc)
+            Some(d) =>
+                if on(c, "Values must fit the type they are written for") and not lit_fits(c.s, a.value, d.type_ref.name, d.type_ref.list_depth, d.type_ref.non_null)
+                    add(var c,
+                        "the argument `" + a.name + "` on `" + sel.name + "` is written as `" + gqllang.print_value(a.value) + "` and its type is `" + gqllang.print_type(d.type_ref) + "`",
+                        a.value.loc)
+    for d in f.args
+        if gqllang.is_non_null(d.type_ref) and d.default_value == None and not list.contains(seen, d.name) and on(c, "Required arguments must be supplied")
+            add(var c,
+                "the field `" + sel.name + "` on `" + parent + "` requires the argument `" + d.name + "`",
+                sel.loc)
+    check_field_selections(var c, parent, sel, f.type_ref.name)
+
+// Whether the field's own selection set matches what its type is: a
+// composite needs one, a leaf refuses one (§ 5.3.3), and the two are
+// one question asked of one type.
+fn check_field_selections(var c: Check, parent: Str, sel: gqllang.GqlSelection, child: Str)
+    if gqlsdl.is_composite(c.s, child)
+        if list.is_empty(sel.selections)
+            if on(c, "Composite fields must have a selection set")
+                add(var c,
+                    "the field `" + sel.name + "` is `" + child + "`, which needs a selection set",
+                    sel.loc)
+        else
+            check_selection_set(var c, child, sel.selections)
+    else
+        if list.len(sel.selections) > 0 and on(c, "Leaf fields must not have a selection set")
+            add(var c,
+                "the field `" + sel.name + "` is `" + child + "`, which is a leaf and takes no selection set",
+                sel.loc)
+
+// A fragment spread: it names a fragment, and that fragment may apply
+// where it is spread (§ 5.5.2.1, § 5.5.2.3).
+fn check_spread(var c: Check, parent: Str, sel: gqllang.GqlSelection)
+    match find_fragment(c.d, sel.name)
+        None    =>
+            if on(c, "A fragment spread must name a fragment that exists")
+                add(var c, "the fragment `" + sel.name + "` is spread and never defined", sel.loc)
+        Some(f) => check_condition(var c, parent, f.type_condition, sel.loc)
+
+// Whether a type condition can ever apply at this place, which is
+// § 5.5.2.3 and is an intersection of § 5.4.2's possible types.
+fn check_condition(var c: Check, parent: Str, cond: Str, spot: gqlerr.GqlLoc)
+    if str.len(cond) == 0 or not on(c, "A fragment spread must be possible")
+        return
+    if gqlsdl.type_named(c.s, cond) == None
+        add(var c, "`" + cond + "` is not a type in this schema", spot)
+        return
+    if not types_overlap(c.s, parent, cond)
+        add(var c,
+            "`... on " + cond + "` can never apply where the enclosing type is `" + parent + "`",
+            spot)
+
+fn types_overlap(s: gqlsdl.GqlSchema, a: Str, b: Str) -> Bool
+    var found = false
+    for t in gqlsdl.possible_types(s, a)
+        if list.contains(gqlsdl.possible_types(s, b), t)
+            found = true
+    found
+
+// ── Merging (§ 5.3.2) ────────────────────────────────────────────────
+
+// The arguments as one canonical text: named, sorted, so two
+// selections merge when they say the same thing in a different order.
+fn arg_signature(args: [gqllang.GqlArgNode]) -> Str
+    var parts: [Str] = list.map(args, a => a.name + ": " + gqllang.print_value(a.value))
+    str.join(list.sort(list.clone(parts)), ",")
+
+// One field selection's signature: its name and its arguments.
+fn selection_signature(sel: gqllang.GqlSelection) -> Str
+    sel.name + "(" + arg_signature(sel.args) + ")"
+
+fn check_merge_set(var c: Check, parent: Str, sels: [gqllang.GqlSelection])
+    if not on(c, "Selections under one response key must merge")
+        return
+    var keys: [Str] = []
+    for sel in sels
+        if sel.kind == "field"
+            let k = gqllang.response_key(sel)
+            if not list.contains(keys, k)
+                keys = list.push(keys, k)
+    for k in keys
+        check_merge_key(var c, parent, sels, k)
+
+fn check_merge_key(var c: Check, parent: Str, sels: [gqllang.GqlSelection], key: Str)
+    var signatures: [Str] = []
+    var subsel: [gqllang.GqlSelection] = []
+    var name = ""
+    var spot = GqlLoc { line: 0, column: 0 }
+    var later = GqlLoc { line: 0, column: 0 }
+    for sel in sels
+        if sel.kind == "field" and gqllang.response_key(sel) == key
+            signatures = list.push(signatures, selection_signature(sel))
+            subsel = list.concat(subsel, sel.selections)
+            if str.len(name) == 0
+                name = sel.name
+                spot = sel.loc
+            elif selection_signature(sel) != list.get(signatures, 0, "")
+                later = sel.loc
+    var distinct: [Str] = []
+    for sign in signatures
+        if not list.contains(distinct, sign)
+            distinct = list.push(distinct, sign)
+    if list.len(distinct) > 1
+        add(var c,
+            "`" + key + "` is asked for twice with selections that do not merge",
+            later_or(spot, later))
+    else
+        check_merge_child(var c, parent, name, subsel)
+
+// Whichever of two places a conflict is written at is the more useful
+// one to point at.
+fn later_or(first: gqlerr.GqlLoc, later: gqlerr.GqlLoc) -> gqlerr.GqlLoc
+    if later.line > 0
+        return later
+    // cov: skip — not reachable from a document that was parsed: `gqllang` gives every selection a location, so the second of two conflicting selections always has a line to point at.  The arm answers for a document a caller assembled by hand, which is the shape a gateway splicing two documents produces.
+    first
+
+// The merged subselections of one key, checked as one set — which is
+// what makes `{ user { name } user { email } }` merge rather than
+// conflict.
+fn check_merge_child(var c: Check, parent: Str, name: Str, subsel: [gqllang.GqlSelection])
+    if list.is_empty(subsel) or str.len(name) == 0
+        return
+    match gqlsdl.field_named(c.s, parent, name)
+        None    =>
+            c.out = c.out
+        Some(f) => check_merge_set(var c, f.type_ref.name, subsel)
+
+// ── Directives (§ 5.7) ───────────────────────────────────────────────
+
+fn check_directives_on(var c: Check, dirs: [gqllang.GqlDirectiveNode], where_word: Str,
+                       spot: gqlerr.GqlLoc)
+    if list.is_empty(dirs)
+        return
+    var seen: [Str] = []
+    for d in dirs
+        check_directive(var c, d, where_word, spot, seen)
+        seen = list.push(seen, d.name)
+
+fn check_directive(var c: Check, d: gqllang.GqlDirectiveNode, where_word: Str, spot: gqlerr.GqlLoc,
+                   seen: [Str])
+    for a in d.args
+        check_value_objects(var c, a.value)
+    match find_directive_def(c.s, d.name)
+        None      =>
+            if on(c, "Directives must be defined")
+                add(var c, "the directive `@" + d.name + "` is not defined", d.loc)
+        Some(def) =>
+            if list.len(def.locations) > 0 and not list.contains(def.locations, where_word) and on(c, "Directives must be in a valid location")
+                add(var c, "`@" + d.name + "` may not appear on " + location_article(where_word)
+                       + " " + location_words(where_word),
+                       d.loc)
+            if list.contains(seen, d.name) and not def.repeatable and on(c, "Directives must be unique at one location")
+                add(var c, "`@" + d.name + "` is not repeatable and appears twice in one place", d.loc)
+
+// The article the word takes: "a field" and "an inline fragment".
+// Separate from the word because "a inline fragment" is the same
+// mistake as "a INLINE_FRAGMENT" — a message written for a parser
+// rather than for a person — and only one of the eight words is
+// spelled with a vowel.
+fn location_article(w: Str) -> Str
+    if w == "INLINE_FRAGMENT"
+        return "an"
+    "a"
+
+// A location's word as a reader says it.  The specification's spellings
+// are `FIELD` and `INLINE_FRAGMENT`; a message that said "a FIELD" is a
+// message written for a parser rather than for a person.
+fn location_words(w: Str) -> Str
+    match w
+        "FIELD"               => "field"
+        "INLINE_FRAGMENT"     => "inline fragment"
+        "FRAGMENT_SPREAD"     => "fragment spread"
+        "FRAGMENT_DEFINITION" => "fragment definition"
+        "VARIABLE_DEFINITION" => "variable definition"
+        "QUERY"               => "query operation"
+        "MUTATION"            => "mutation operation"
+        "SUBSCRIPTION"        => "subscription operation"
+        _                     =>
+            // cov: skip — unreachable from here: the eight call sites pass the specification's eight locations and nothing else, so the fallthrough is the function's own completeness.  It is kept rather than deleted because a § 3.13 location this reader does not know is better answered with a sentence than with an empty word.
+            str.lower(w) + " definition"
+
+// ── Object values, one level down (§ 5.6.3) ──────────────────────────
+
+fn check_value_objects(var c: Check, v: gqllang.GqlValueNode)
+    if v.kind != "object"
+        return
+    for n in duplicate_member_names(v)
+        if on(c, "Input object fields must be unique")
+            add(var c, "the input object field `" + n + "` is given twice", v.loc)
+
+// ── Variables (§ 5.8.3, § 5.8.4) ─────────────────────────────────────
+
+fn value_vars(v: gqllang.GqlValueNode) -> [Str]
+    if v.kind == "variable"
+        return [v.text]
+    var out: [Str] = []
+    for item in v.items
+        out = list.concat(out, value_vars(item))
+    out
+
+// Every variable an operation uses, fragments it spreads included: a
+// variable used only inside a spread fragment is still used.
+//
+// `seen` is shared by the whole walk, so a fragment spread along many
+// paths is read once: the cost is the size of the document and not the
+// number of paths through its fragments.
+fn used_vars(sels: [gqllang.GqlSelection], d: gqllang.GqlDocument, var seen: [Str]) -> [Str]
+    var out: [Str] = []
+    for sel in sels
+        for a in sel.args
+            out = list.concat(out, value_vars(a.value))
+        for dr in sel.directives
+            for a in dr.args
+                out = list.concat(out, value_vars(a.value))
+        if sel.kind == "spread"
+            if not list.contains(seen, sel.name)
+                seen = list.push(seen, sel.name)
+                match gqllang.fragment_of(d, sel.name)
+                    None    => ()
+                    Some(f) =>
+                        out = list.concat(out, used_vars(f.selections, d, var seen))
+        else
+            out = list.concat(out, used_vars(sel.selections, d, var seen))
+    out
+
+// Where a variable is first used, so its diagnostic points at the use
+// rather than at the operation.
+fn first_use_loc(sels: [gqllang.GqlSelection], d: gqllang.GqlDocument, name: Str) -> ?gqlerr.GqlLoc
+    var entered: [Str] = []
+    first_use_from(sels, d, name, var entered)
+
+// The walk, carrying the fragments it has already entered.  The list is
+// shared by the whole walk: a fragment entered once and found without the
+// variable has nothing for a second visit to find, so each fragment is
+// read once however many paths lead to it.
+//
+// THE GUARD IS LOAD-BEARING AND NOT AN OPTIMISATION.  A fragment that
+// spreads into a cycle is exactly the document § 5.5.2.2 exists to
+// refuse, and `check_spreads_resolve` reports it before
+// `check_variables` runs — but reporting it does not stop the walk, so
+// without the guard a cyclic document with one undeclared variable
+// costs the process its stack.  Measured on 0.20.2: `validate` of
+// `{ ...A } fragment A on Query { ...B } fragment B on Query { ...A
+// count(n: $x) }` is SIGSEGV, which is the denial of service the cycle
+// rule was written to prevent.
+fn first_use_from(sels: [gqllang.GqlSelection], d: gqllang.GqlDocument, name: Str,
+                  var seen: [Str]) -> ?gqlerr.GqlLoc
+    var found: ?gqlerr.GqlLoc = None
+    for sel in sels
+        for a in sel.args
+            if found == None and list.contains(value_vars(a.value), name)
+                found = Some(a.loc)
+        for dr in sel.directives
+            for a in dr.args
+                if found == None and list.contains(value_vars(a.value), name)
+                    found = Some(a.loc)
+        if found == None and sel.kind == "spread"
+            if not list.contains(seen, sel.name)
+                seen = list.push(seen, sel.name)
+                match gqllang.fragment_of(d, sel.name)
+                    None    =>
+                        found = None
+                    Some(f) =>
+                        if found == None
+                            found = first_use_from(f.selections, d, name, var seen)
+        if found == None
+            found = first_use_from(sel.selections, d, name, var seen)
+    found
+
+fn check_variables(var c: Check, op: gqllang.GqlOperation, d: gqllang.GqlDocument)
+    var declared: [Str] = list.map(op.variables, v => v.name)
+    var entered: [Str] = []
+    let used = used_vars(op.selections, d, var entered)
+    var reported: [Str] = []
+    for u in used
+        if not list.contains(reported, u)
+            reported = list.push(reported, u)
+            if not list.contains(declared, u) and on(c, "Variables must be declared before they are used")
+                let spot = match first_use_loc(op.selections, d, u)
+                    Some(place) => place
+                    // cov: skip — unreachable: `first_use_from` checks every place `used_vars` collects and one more (it descends into a spread's own selections, which `used_vars` skips), so a name that reached this loop is always locatable.  The arm is the match's completeness.
+                    None        => op.loc
+                add(var c, "the variable `$" + u + "` is used and never declared", spot)
+    for v in op.variables
+        if not list.contains(used, v.name) and on(c, "Every declared variable must be used")
+            add(var c, "the variable `$" + v.name + "` is declared and never used", v.loc)
+
+// ── Fragments (§ 5.5) ────────────────────────────────────────────────
+
+// The fragments a selection set spreads, directly.
+fn spread_names(sels: [gqllang.GqlSelection]) -> [Str]
+    var out: [Str] = []
+    for sel in sels
+        if sel.kind == "spread"
+            out = list.push(out, sel.name)
+        else
+            out = list.concat(out, spread_names(sel.selections))
+    out
+
+// Whether a fragment is reachable from an operation, following spreads.
+//
+// `seen` is shared by the whole search, so a fragment is searched from
+// once however many fragments spread it.
+fn reachable(d: gqllang.GqlDocument, name: Str, var seen: [Str]) -> Bool
+    if list.contains(seen, name)
+        return false
+    seen = list.push(seen, name)
+    for op in d.operations
+        if list.contains(spread_names(op.selections), name)
+            return true
+    for f in d.fragments
+        if list.contains(spread_names(f.selections), name)
+            if reachable(d, f.name, var seen)
+                return true
+    false
+
+// ── Directives, the pieces a caller asks for alone ───────────────────
+
+// The checks that need the whole document rather than one selection at
+// a time: § 5.5.1.1, § 5.5.1.4 and § 5.5.2.2.
+fn check_fragment_names(var c: Check, d: gqllang.GqlDocument)
+    var seen: [Str] = []
+    for f in d.fragments
+        if list.contains(seen, f.name) and on(c, "Fragment names must be unique")
+            add(var c, "the fragment `" + f.name + "` is defined more than once", f.loc)
+        seen = list.push(seen, f.name)
+
+fn check_fragments_used(var c: Check, d: gqllang.GqlDocument)
+    if not on(c, "Fragments must be used")
+        return
+    for f in d.fragments
+        var searched: [Str] = []
+        if not reachable(d, f.name, var searched)
+            add(var c, "the fragment `" + f.name + "` is defined and never spread", f.loc)
+
+// § 5.5.2.2 — the one rule that needs the whole document rather than a
+// walk.
+//
+// A cycle is a property of the fragments together, and the walk cannot
+// simply recurse into one: a cyclic fragment is a document that expands
+// forever, which is exactly the denial of service this rule exists to
+// refuse.  So the check is a separate graph question, asked before
+// anything walks a spread.
+fn check_spreads_resolve(var c: Check, d: gqllang.GqlDocument)
+    if not on(c, "Fragment spreads must not form cycles")
+        return
+    let cycle = fragment_cycle(d)
+    if list.len(cycle) > 0
+        add(var c, "fragment spreads form a cycle: " + str.join(cycle, " → "), cycle_spot(d, cycle))
+
+// Where to point at a cycle: the first spread that is part of it.
+fn cycle_spot(d: gqllang.GqlDocument, cycle: [Str]) -> gqlerr.GqlLoc
+    for f in d.fragments
+        for s in walk_spreads(f.selections)
+            if list.contains(cycle, s.name)
+                return s.loc
+    // cov: skip — unreachable: `cycle_from` only ever follows a spread into a fragment, so every spread a cycle is made of is inside a fragment's selections, which is exactly what the loop above walks.  The arm answers a cycle a caller passed in from somewhere other than this document.
+    GqlLoc { line: 0, column: 0 }
+
+// Every spread in a document, as selections, so a diagnostic can point
+// at one.
+fn walk_spreads(sels: [gqllang.GqlSelection]) -> [gqllang.GqlSelection]
+    var out: [gqllang.GqlSelection] = []
+    for sel in sels
+        if sel.kind == "spread"
+            out = list.push(out, sel)
+        else
+            out = list.concat(out, walk_spreads(sel.selections))
+    out
+
+// ── The document walk ────────────────────────────────────────────────
+
+fn check_operations(var c: Check, d: gqllang.GqlDocument)
+    var seen: [Str] = []
+    for op in d.operations
+        if str.len(op.name) > 0
+            if list.contains(seen, op.name) and on(c, "Operation names must be unique")
+                add(var c, "the operation `" + op.name + "` is defined more than once", op.loc)
+            seen = list.push(seen, op.name)
+    if list.len(d.operations) > 1
+        for op in d.operations
+            if str.len(op.name) == 0 and on(c, "An anonymous operation must be the only operation")
+                add(var c,
+                    "this operation is anonymous and the document has another operation",
+                    op.loc)
+    for op in d.operations
+        check_operation(var c, op, d)
+
+fn check_operation(var c: Check, op: gqllang.GqlOperation, d: gqllang.GqlDocument)
+    check_directives_on(var c, op.directives, op_location(op.kind), op.loc)
+    for v in op.variables
+        check_directives_on(var c, v.directives, "VARIABLE_DEFINITION", v.loc)
+    check_variables(var c, op, d)
+    let root = root_type(c.s, op.kind)
+    if str.len(root) == 0
+        add(var c, "this schema has no " + op_word(op.kind) + " root type", op.loc)
+    else
+        check_selection_set(var c, root, op.selections)
+    if op_word(op.kind) == "subscription" and list.len(op.selections) != 1 and on(c, "A subscription must have exactly one root field")
+        add(var c,
+            "a subscription has one root field and this one has " + str.from_int(list.len(op.selections)),
+            op.loc)
+
+fn check_fragments(var c: Check, d: gqllang.GqlDocument)
+    for f in d.fragments
+        check_directives_on(var c, f.directives, "FRAGMENT_DEFINITION", f.loc)
+        check_selection_set(var c, f.type_condition, f.selections)
+
+fn run_checks(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument, rules: [Str]) -> [gqlerr.GqlError]
+    var c = Check { s: s, d: d, enabled: rules, out: [] }
+    check_fragment_names(var c, d)
+    check_fragments_used(var c, d)
+    check_spreads_resolve(var c, d)
+    check_operations(var c, d)
+    check_fragments(var c, d)
+    c.out
+
+// ── The rules a caller reaches for individually ──────────────────────
+
+// § 5.5.2.2 — the fragments of a cycle, in order, or nothing.
+//
+// The walk answers the first cycle it finds, as the names it passed
+// through and the name it came back to: `A → B → A` is a sentence a
+// developer can act on where "cyclic fragment" is not.
+//
+// `done` holds the fragments already walked without finding a cycle, so
+// a fragment spread along many paths is walked once.
+fn cycle_from(d: gqllang.GqlDocument, name: Str, path: [Str], var done: [Str]) -> [Str]
+    if list.contains(done, name)
+        return []
+    let here = list.push(list.clone(path), name)
+    var found: [Str] = []
+    match gqllang.fragment_of(d, name)
+        None    =>
+            found = []
+        Some(f) =>
+            for s in spread_names(f.selections)
+                if list.len(found) == 0
+                    if list.contains(here, s)
+                        found = cycle_text(here, s)
+                    else
+                        let deeper = cycle_from(d, s, here, var done)
+                        if list.len(deeper) > 0
+                            found = list.clone(deeper)
+    if list.len(found) == 0
+        done = list.push(done, name)
+    found
+
+// The cycle as written: from the first mention of `name` to its
+// second.
+fn cycle_text(path: [Str], name: Str) -> [Str]
+    var out: [Str] = []
+    var started = false
+    for p in path
+        if p == name
+            started = true
+        if started
+            out = list.push(out, p)
+    out = list.push(out, name)
+    out
 
 // Everything wrong with a document, against a schema.
 //
@@ -66,7 +845,7 @@ use gqlsdl
 //                 Ok(d)  => println("${list.len(gqlcheck.validate(s, d))}")
 // ```
 pub fn validate(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.validate")
+    run_checks(s, d, rule_names())
 
 // Whether a document is valid, which is `validate` answering nothing.
 //
@@ -84,7 +863,7 @@ pub fn validate(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError
 //                 Ok(d)  => println("${gqlcheck.is_valid(s, d)}")
 // ```
 pub fn is_valid(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> Bool []
-    todo("graphql-nv.gqlcheck.is_valid")
+    list.len(validate(s, d)) == 0
 
 // The § 5 rules this package implements, in the specification's own
 // spelling.
@@ -100,7 +879,8 @@ pub fn is_valid(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> Bool []
 //     println("${list.len(gqlcheck.rule_names())}")
 // ```
 pub fn rule_names() -> [Str] []
-    todo("graphql-nv.gqlcheck.rule_names")
+    var out: [Str] = list.map(rule_table(), r => r.name)
+    out
 
 // The specification section a rule comes from: `5.5.2.2`.
 //
@@ -113,7 +893,11 @@ pub fn rule_names() -> [Str] []
 //     println(gqlcheck.rule_section("Fragment spreads must not form cycles"))
 // ```
 pub fn rule_section(rule: Str) -> Str []
-    todo("graphql-nv.gqlcheck.rule_section")
+    var section = ""
+    for r in rule_table()
+        if r.name == rule and str.len(section) == 0
+            section = r.section
+    section
 
 // Validation with only the named rules applied.
 //
@@ -139,7 +923,11 @@ pub fn rule_section(rule: Str) -> Str []
 // ```
 pub fn validate_only(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
                      rules: [Str]) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.validate_only")
+    var wanted: [Str] = []
+    for r in rules
+        if list.contains(rule_names(), r)
+            wanted = list.push(wanted, r)
+    run_checks(s, d, wanted)
 
 // Validation with the named rules skipped.
 //
@@ -166,7 +954,11 @@ pub fn validate_only(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
 // ```
 pub fn validate_except(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
                        rules: [Str]) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.validate_except")
+    var kept: [Str] = []
+    for r in rule_names()
+        if not list.contains(rules, r)
+            kept = list.push(kept, r)
+    run_checks(s, d, kept)
 
 // ── The rules a caller reaches for individually ──────────────────────
 //
@@ -196,7 +988,12 @@ pub fn validate_except(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument,
 //         Ok(d)  => println("${list.len(gqlcheck.fragment_cycle(d))}")
 // ```
 pub fn fragment_cycle(d: gqllang.GqlDocument) -> [Str] []
-    todo("graphql-nv.gqlcheck.fragment_cycle")
+    var out: [Str] = []
+    var done: [Str] = []
+    for f in d.fragments
+        if list.len(out) == 0
+            out = cycle_from(d, f.name, [], var done)
+    out
 
 // § 5.3.2 — whether two selections that share a response key can be
 // merged.
@@ -224,7 +1021,7 @@ pub fn fragment_cycle(d: gqllang.GqlDocument) -> [Str] []
 //                 Ok(d)  => println("${list.len(gqlcheck.merge_conflicts(s, d))}")
 // ```
 pub fn merge_conflicts(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.merge_conflicts")
+    run_checks(s, d, ["Selections under one response key must merge"])
 
 // § 5.8.3 and § 5.8.4 — whether every variable a document uses is
 // declared, and every variable it declares is used.
@@ -248,7 +1045,8 @@ pub fn merge_conflicts(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.G
 //                 Ok(d)  => println("${list.len(gqlcheck.variable_problems(s, d))}")
 // ```
 pub fn variable_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.variable_problems")
+    run_checks(s, d, ["Variables must be declared before they are used",
+                      "Every declared variable must be used"])
 
 // § 5.5.2.3 — whether a fragment's type condition can ever apply where
 // it is spread.
@@ -272,7 +1070,7 @@ pub fn variable_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr
 //                 Ok(d)  => println("${list.len(gqlcheck.impossible_fragments(s, d))}")
 // ```
 pub fn impossible_fragments(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.impossible_fragments")
+    run_checks(s, d, ["A fragment spread must be possible"])
 
 // ── Variables ────────────────────────────────────────────────────────
 
@@ -306,7 +1104,43 @@ pub fn impossible_fragments(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gql
 // ```
 pub fn coerce_variables(s: gqlsdl.GqlSchema, op: gqllang.GqlOperation,
                         variables_json: Str) -> Result<Str, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlcheck.coerce_variables")
+    match json.parse(variables_json)
+        None    => Err(GqlRequestMalformed("the variables are not JSON"))
+        Some(v) =>
+            if json.type_of(v) != "object"
+                Err(GqlRequestMalformed("the variables must be a JSON object"))
+            else
+                coerce_object(s, op, v)
+
+fn coerce_object(s: gqlsdl.GqlSchema, op: gqllang.GqlOperation,
+                 v: json.JsonValueH) -> Result<Str, gqlerr.GqlFault>
+    var errors: [gqlerr.GqlError] = []
+    var parts: [Str] = []
+    for d in op.variables
+        match json.get(v, d.name)
+            None        =>
+                if gqllang.is_non_null(d.type_ref) and d.default_value == None
+                    errors = list.push(errors,
+                        gqlerr.error("the variable `$" + d.name + "` is required and was not supplied"))
+                else
+                    parts = list.push(parts, "\"" + d.name + "\":" + default_json(d))
+            Some(given) =>
+                if json_fits(s, given, d.type_ref.name, d.type_ref.list_depth, d.type_ref.non_null)
+                    parts = list.push(parts, "\"" + d.name + "\":" + json.stringify(given))
+                else
+                    errors = list.push(errors,
+                        gqlerr.error("the variable `$" + d.name + "` is " + json.stringify(given) + " and its type is `" + gqllang.print_type(d.type_ref) + "`"))
+    if list.len(errors) > 0
+        Err(GqlVariablesInvalid(errors))
+    else
+        Ok("{" + str.join(parts, ",") + "}")
+
+// A variable that was not supplied: its default where it has one, and
+// null where it is nullable.
+fn default_json(d: gqllang.GqlVarDef) -> Str
+    match d.default_value
+        Some(v) => gqllang.print_value(v)
+        None    => "null"
 
 // Whether a JSON value fits a declared GraphQL type.
 //
@@ -333,7 +1167,9 @@ pub fn coerce_variables(s: gqlsdl.GqlSchema, op: gqllang.GqlOperation,
 //                 Some(t) => println("${gqlcheck.value_fits(s, "42", t)}")
 // ```
 pub fn value_fits(s: gqlsdl.GqlSchema, value_json: Str, t: gqllang.GqlTypeRef) -> Bool []
-    todo("graphql-nv.gqlcheck.value_fits")
+    match json.parse(value_json)
+        None    => false
+        Some(v) => json_fits(s, v, t.name, t.list_depth, t.non_null)
 
 // ── Directives ───────────────────────────────────────────────────────
 
@@ -353,7 +1189,37 @@ pub fn value_fits(s: gqlsdl.GqlSchema, value_json: Str, t: gqllang.GqlTypeRef) -
 //     println("${gqlcheck.selection_included(gqllang.field_selection("me"), "{}")}")
 // ```
 pub fn selection_included(sel: gqllang.GqlSelection, variables_json: Str) -> Bool []
-    todo("graphql-nv.gqlcheck.selection_included")
+    var skipped = false
+    var left_out = false
+    for d in sel.directives
+        if d.name == "skip" and directive_if(d, variables_json)
+            skipped = true
+        elif d.name == "include" and not directive_if(d, variables_json)
+            left_out = true
+    not skipped and not left_out
+
+// The `if` argument of `@skip` or `@include`, as a truth value.
+fn directive_if(d: gqllang.GqlDirectiveNode, variables_json: Str) -> Bool
+    var yes = false
+    for a in d.args
+        if a.name == "if"
+            yes = value_truth(a.value, variables_json)
+    yes
+
+fn value_truth(v: gqllang.GqlValueNode, variables_json: Str) -> Bool
+    if v.kind == "boolean"
+        return v.text == "true"
+    if v.kind == "variable"
+        return variable_truth(variables_json, v.text)
+    false
+
+fn variable_truth(variables_json: Str, name: Str) -> Bool
+    match json.parse(variables_json)
+        None      => false
+        Some(obj) =>
+            match json.get_bool(obj, name)
+                Some(b) => b
+                None    => false
 
 // § 5.7.1 and § 5.7.2 — whether every directive in a document is
 // defined and in a location it may appear.
@@ -377,7 +1243,9 @@ pub fn selection_included(sel: gqllang.GqlSelection, variables_json: Str) -> Boo
 //                 Ok(d)  => println("${list.len(gqlcheck.directive_problems(s, d))}")
 // ```
 pub fn directive_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqlerr.GqlError] []
-    todo("graphql-nv.gqlcheck.directive_problems")
+    run_checks(s, d, ["Directives must be defined",
+                      "Directives must be in a valid location",
+                      "Directives must be unique at one location"])
 
 // ── What is deliberately not checked ─────────────────────────────────
 
@@ -398,4 +1266,8 @@ pub fn directive_problems(s: gqlsdl.GqlSchema, d: gqllang.GqlDocument) -> [gqler
 //     println("${list.len(gqlcheck.unchecked_rules())}")
 // ```
 pub fn unchecked_rules() -> [Str] []
-    todo("graphql-nv.gqlcheck.unchecked_rules")
+    ["5.1.1 Executable definitions: `gqllang.parse_executable` refuses a type-system definition by name, so no document reaches a validator carrying one",
+     "5.5.1.2 A fragment's type condition must exist: folded into 5.5.2.3, which reports a spread on a type this schema does not have",
+     "5.6.1 the custom-scalar half: whether `\"2026-13-45\"` is a valid `Date` is the scalar's own question, and a validator that guessed would reject values a deployment accepts; `gqlexec.GqlResolver` is where a scalar's coercion belongs",
+     "5.8.1 Variable uniqueness and 5.8.2 variables are input types: two declarations of one variable name and a variable declared as an object type both pass; `gqlsdl.build` has already refused a schema that offered an output type as input",
+     "5.8.5 All variable usages are allowed: the declared type against the type of the location it is used at; a deployment that needs it composes `gqlsdl.arg_named` with `value_fits`"]

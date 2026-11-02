@@ -1,9 +1,6 @@
 // gqlcheck_tests.nv — § 5's rules, and the one that is a security
 // control.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqlcheck.<fn>`.
-//
 // VALIDATION CANNOT FAIL, which is why every assertion below is about
 // a LIST rather than a `Result`: a document that does not satisfy the
 // schema is the ANSWER — a 400 whose body is the list — and modelling
@@ -63,6 +60,18 @@ fn test_the_rule_list_is_the_contract() [io]
     test.case("and each names its section")
     test.assert_eq_str(gqlcheck.rule_section("Fragment spreads must not form cycles"),
                        "5.5.2.2")
+
+@test
+fn test_fragments_that_only_spread_each_other_are_never_spread_by_an_operation() [io]
+    // § 5.5.1.4.  The search for a spread follows fragments into
+    // fragments, and a cycle among unused ones must end it rather than
+    // walk it for ever.
+    test.case("two fragments that spread each other, and no operation that spreads either")
+    match doc("{ me } fragment A on Pet { name ...B } fragment B on Pet { name ...A }")
+        None    => test.assert(false)
+        Some(d) =>
+            let only = ["Fragments must be used"]
+            test.assert_eq(list.len(gqlcheck.validate_only(a_schema(), d, only)), 2)
 
 @test
 fn test_a_rule_can_be_applied_alone_or_skipped_by_name() [io]

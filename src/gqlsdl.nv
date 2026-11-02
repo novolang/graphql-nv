@@ -1,8 +1,6 @@
 // gqlsdl.nv — the schema definition language, parsed into a typed
 // schema.  `[]` throughout.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A SCHEMA IS A VALUE, AND THAT IS WHY THIS PACKAGE HAS NO MACRO.
 // async-graphql derives a schema from Rust types with `#[Object]`;
 // strawberry derives one from Python classes with decorators.  Neither
@@ -30,6 +28,8 @@
 // types reports six, because a person fixing them one build at a time
 // is six builds.
 
+use std.list
+use std.str
 use gqlerr
 use gqllang
 
@@ -143,6 +143,1267 @@ pub struct GqlSchema
     subscription_type: Str
     description: Str
 
+// ── The SDL scanner ──────────────────────────────────────────────────
+
+// One token: what it is, the span it came from, and where it starts.
+//
+// The SPAN matters: a type and a value are parsed by handing their
+// spelled-out text to `gqllang`, which already parses both, rather
+// than by parsing them a second time here and having the two copies
+// drift.  `start` and `stop` are byte offsets into the source, so
+// `str.slice` cuts exactly the text the tokens covered.
+struct STok
+    kind: Str
+    text: Str
+    line: Int
+    col: Int
+    start: Int
+    stop: Int
+
+struct SLex
+    src: Str
+    cs: [Str]
+    var i: Int
+    var line: Int
+    var col: Int
+    var off: Int
+    var fault: ?gqlerr.GqlFault
+
+fn s_ch(l: SLex, k: Int) -> Str
+    list.get(l.cs, k, "")
+
+fn s_here(l: SLex) -> Str
+    s_ch(l, l.i)
+
+fn s_done(l: SLex) -> Bool
+    l.i >= list.len(l.cs)
+
+fn s_lex_fail(var l: SLex, msg: Str)
+    if l.fault == None
+        l.fault = Some(GqlSyntaxError(msg, l.line, l.col))
+
+fn s_advance(var l: SLex)
+    let c = s_here(l)
+    l.i = l.i + 1
+    l.off = l.off + str.len(c)
+    if c == "\n"
+        l.line = l.line + 1
+        l.col = 1
+    else
+        l.col = l.col + 1
+
+fn s_is_digit(c: Str) -> Bool
+    if str.len(c) != 1
+        return false
+    let b = str.byte_at(c, 0) ?? 0
+    b >= 48 and b <= 57
+
+fn s_is_name_start(c: Str) -> Bool
+    if str.len(c) != 1
+        return false
+    let b = str.byte_at(c, 0) ?? 0
+    b >= 65 and b <= 90 or b >= 97 and b <= 122 or b == 95
+
+fn s_is_name_char(c: Str) -> Bool
+    s_is_name_start(c) or s_is_digit(c)
+
+fn s_skip_ignored(var l: SLex)
+    var done = false
+    while not done
+        let c = s_here(l)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "," or c == "\u{feff}"
+            s_advance(var l)
+        elif c == "#"
+            while s_here(l) != "" and s_here(l) != "\n"
+                s_advance(var l)
+        else
+            done = true
+
+fn s_scan_string(var l: SLex)
+    // A ladder, not a `match`: a match arm guard that builds a `Str` leaks
+    // that temporary under the leak check of `novo test`.
+    if s_ch(l, l.i + 1) == "\"" and s_ch(l, l.i + 2) == "\""
+        s_advance(var l)
+        s_advance(var l)
+        s_advance(var l)
+        var closed = false
+        while not closed and l.fault == None
+            let c = s_here(l)
+            if c == ""
+                s_lex_fail(var l, "a block string that runs to the end of the document")
+            elif c == "\\" and s_ch(l, l.i + 1) == "\"" and s_ch(l, l.i + 2) == "\"" and s_ch(l, l.i + 3) == "\""
+                s_advance(var l)
+                s_advance(var l)
+                s_advance(var l)
+                s_advance(var l)
+            elif c == "\"" and s_ch(l, l.i + 1) == "\"" and s_ch(l, l.i + 2) == "\""
+                s_advance(var l)
+                s_advance(var l)
+                s_advance(var l)
+                closed = true
+            else
+                s_advance(var l)
+    else
+        s_advance(var l)
+        var closed = false
+        while not closed and l.fault == None
+            let c = s_here(l)
+            if c == ""
+                s_lex_fail(var l, "a string that runs to the end of the document")
+            elif c == "\""
+                s_advance(var l)
+                closed = true
+            elif c == "\n"
+                s_lex_fail(var l, "a line break inside a string")
+            elif c == "\\"
+                s_advance(var l)
+                s_advance(var l)
+            else
+                s_advance(var l)
+
+// One token, consuming it.  A string's text is the RAW source it came
+// from; the decoded value is read by handing that text to
+// `gqllang.parse_value`, which is where the escape decoding lives.
+fn s_lex_one(var l: SLex) -> STok
+    let line = l.line
+    let col = l.col
+    let start = l.off
+    let c = s_here(l)
+    if c == "\""
+        s_scan_string(var l)
+        STok { kind: "string",
+            text: str.slice(l.src, start, l.off),
+            line: line,
+            col: col,
+            start: start,
+            stop: l.off }
+    elif s_is_name_start(c)
+        while s_is_name_char(s_here(l))
+            s_advance(var l)
+        STok { kind: "name",
+            text: str.slice(l.src, start, l.off),
+            line: line,
+            col: col,
+            start: start,
+            stop: l.off }
+    elif s_is_digit(c) or c == "-" and s_is_digit(s_ch(l, l.i + 1))
+        if c == "-"
+            s_advance(var l)
+        while s_is_digit(s_here(l))
+            s_advance(var l)
+        if s_here(l) == "."
+            s_advance(var l)
+            while s_is_digit(s_here(l))
+                s_advance(var l)
+        if s_here(l) == "e" or s_here(l) == "E"
+            s_advance(var l)
+            if s_here(l) == "+" or s_here(l) == "-"
+                s_advance(var l)
+            while s_is_digit(s_here(l))
+                s_advance(var l)
+        STok { kind: "number",
+            text: str.slice(l.src, start, l.off),
+            line: line,
+            col: col,
+            start: start,
+            stop: l.off }
+    elif c == "." and s_ch(l, l.i + 1) == "." and s_ch(l, l.i + 2) == "."
+        s_advance(var l)
+        s_advance(var l)
+        s_advance(var l)
+        STok { kind: "punct", text: "...", line: line, col: col, start: start, stop: l.off }
+    elif str.contains("!$&():=@[]{|}", c)
+        s_advance(var l)
+        STok { kind: "punct", text: c, line: line, col: col, start: start, stop: l.off }
+    else
+        s_lex_fail(var l, "a character that cannot start a token")
+        STok { kind: "punct", text: "", line: line, col: col, start: start, stop: l.off }
+
+fn s_lex(source: Str) -> Result<[STok], gqlerr.GqlFault> []
+    var l = SLex { src: source, cs: str.chars(source), i: 0, line: 1, col: 1, off: 0, fault: None }
+    var out: [STok] = []
+    while not s_done(l) and l.fault == None
+        s_skip_ignored(var l)
+        if not s_done(l) and l.fault == None
+            out = list.push(out, s_lex_one(var l))
+    if l.fault != None
+        return Err(l.fault ?? GqlSyntaxError("the schema did not lex", 1, 1))
+    out = list.push(out, STok { kind: "eof", text: "", line: l.line, col: l.col, start: l.off, stop: l.off })
+    Ok(out)
+
+// ── The SDL parser ───────────────────────────────────────────────────
+
+// What one SDL document holds: the types, the directives, and the
+// roots a `schema` block named.  `parse` publishes the first two;
+// `build` needs all three.
+struct SdlParsed
+    types: [GqlTypeDef]
+    directives: [GqlDirectiveDef]
+    query_type: Str
+    mutation_type: Str
+    subscription_type: Str
+
+// The roots a `schema` block named, empty where it named none.
+struct GqlRoots
+    query: Str
+    mutation: Str
+    subscription: Str
+
+struct SCur
+    toks: [STok]
+    src: Str
+    var i: Int
+    var fault: ?gqlerr.GqlFault
+
+fn s_tok(c: SCur) -> STok
+    if c.i < 0 or c.i >= list.len(c.toks)
+        return STok { kind: "eof", text: "", line: 0, col: 0, start: 0, stop: 0 }
+    list.get(c.toks, c.i)
+
+fn s_kind(c: SCur) -> Str
+    let t = s_tok(c)
+    t.kind
+
+fn s_say(c: SCur) -> Str
+    let t = s_tok(c)
+    t.text
+
+fn s_at_end(c: SCur) -> Bool
+    s_kind(c) == "eof"
+
+fn s_failed(c: SCur) -> Bool
+    c.fault != None
+
+fn s_the_fault(c: SCur) -> gqlerr.GqlFault
+    c.fault ?? GqlSchemaInvalid("the schema did not parse")
+
+fn s_fail(var c: SCur, msg: Str)
+    if c.fault == None
+        let t = s_tok(c)
+        c.fault = Some(GqlSyntaxError(msg, t.line, t.col))
+
+fn s_bump(var c: SCur) -> STok
+    let t = s_tok(c)
+    c.i = c.i + 1
+    t
+
+fn s_on(c: SCur, t: Str) -> Bool
+    s_kind(c) == "punct" and s_say(c) == t
+
+fn s_eat(var c: SCur, t: Str) -> Bool
+    if s_failed(c)
+        return false
+    if not s_on(c, t)
+        return false
+    c.i = c.i + 1
+    true
+
+fn s_want(var c: SCur, t: Str)
+    if not s_eat(var c, t)
+        s_fail(var c, "expected `" + t + "`")
+
+fn s_want_name(var c: SCur, what: Str) -> Str
+    if s_failed(c)
+        // cov: skip — every call site sits inside a `not s_failed(c)` guard, so a fault here was already recorded by the loop that called it and this answer cannot be the first to notice one
+        return ""
+    if s_kind(c) != "name"
+        s_fail(var c, "expected " + what)
+        return ""
+    let t = s_bump(var c)
+    t.text
+
+fn s_is_word(c: SCur, word: Str) -> Bool
+    s_kind(c) == "name" and s_say(c) == word
+
+// A description, decoded through `gqllang.parse_value` so that block
+// strings and escapes are read the one way this package reads them.
+fn s_take_description(var c: SCur) -> Str
+    if s_kind(c) != "string"
+        return ""
+    let t = s_bump(var c)
+    let raw = str.slice(c.src, t.start, t.stop)
+    match gqllang.parse_value(raw)
+        Some(v) => v.text
+        None    => ""
+
+// One type, consumed and parsed.  The tokens are consumed here and the
+// text they covered is handed to `gqllang.parse_type`, so there is one
+// parser for the written form of a type rather than two.
+fn s_take_type(var c: SCur) -> gqllang.GqlTypeRef
+    let first = s_tok(c)
+    let stop = s_eat_type_tokens(var c)
+    let raw = str.slice(c.src, first.start, stop)
+    match gqllang.parse_type(raw)
+        Some(t) => t
+        None    =>
+            s_fail(var c, "expected a type")
+            gqllang.named_type("")
+
+// The byte offset one past the last token of a type, consuming them.
+fn s_eat_type_tokens(var c: SCur) -> Int
+    var stop = 0
+    if s_on(c, "[")
+        let open = s_bump(var c)
+        stop = open.stop
+        stop = s_eat_type_tokens(var c)
+        if s_on(c, "]")
+            let close = s_bump(var c)
+            stop = close.stop
+    else
+        let base = s_bump(var c)
+        stop = base.stop
+    if s_on(c, "!")
+        let bang = s_bump(var c)
+        stop = bang.stop
+    stop
+
+// One value, consumed and parsed, the same way.
+fn s_take_value(var c: SCur) -> ?gqllang.GqlValueNode
+    let first = s_tok(c)
+    let stop = s_eat_value_tokens(var c)
+    let raw = str.slice(c.src, first.start, stop)
+    gqllang.parse_value(raw)
+
+// The byte offset one past a value's last token, consuming them.
+fn s_eat_value_tokens(var c: SCur) -> Int
+    if s_on(c, "$")
+        s_bump(var c)
+        let nm = s_bump(var c)
+        return nm.stop
+    if s_on(c, "[")
+        let open = s_bump(var c)
+        var stop = open.stop
+        while not s_failed(c) and not s_on(c, "]")
+            if s_at_end(c)
+                s_fail(var c, "a list value that runs to the end of the document")
+            else
+                stop = s_eat_value_tokens(var c)
+        if s_on(c, "]")
+            let close = s_bump(var c)
+            stop = close.stop
+        return stop
+    if s_on(c, "{")
+        let open = s_bump(var c)
+        var stop = open.stop
+        while not s_failed(c) and not s_on(c, "}")
+            if s_at_end(c)
+                s_fail(var c, "an object value that runs to the end of the document")
+            else
+                s_bump(var c)
+                s_bump(var c)
+                stop = s_eat_value_tokens(var c)
+        if s_on(c, "}")
+            let close = s_bump(var c)
+            stop = close.stop
+        return stop
+    let one = s_bump(var c)
+    one.stop
+
+// `@name(args)`, repeated.
+fn s_take_directives(var c: SCur) -> [gqllang.GqlDirectiveNode]
+    var out: [gqllang.GqlDirectiveNode] = []
+    while not s_failed(c) and s_on(c, "@")
+        let at = s_bump(var c)
+        let nm = s_want_name(var c, "a directive name")
+        let args = s_take_args(var c)
+        out = list.push(out,
+            GqlDirectiveNode { name: nm, args: args, loc: GqlLoc { line: at.line, column: at.col } })
+    out
+
+fn s_take_args(var c: SCur) -> [gqllang.GqlArgNode]
+    var out: [gqllang.GqlArgNode] = []
+    if not s_eat(var c, "(")
+        return out
+    while not s_failed(c) and not s_on(c, ")")
+        if s_at_end(c)
+            s_fail(var c, "unterminated argument list")
+        else
+            let start = s_tok(c)
+            let nm = s_want_name(var c, "an argument name")
+            if not s_eat(var c, ":")
+                s_fail(var c, "expected `:` after the argument name")
+            else
+                let v = s_take_value(var c)
+                if v != None
+                    let node = GqlArgNode { name: nm, value: v ?? gqllang.null_value(),
+                                            loc: GqlLoc { line: start.line, column: start.col } }
+                    out = list.push(out, node)
+    s_want(var c, ")")
+    out
+
+// A `&`- or `|`-separated list of type names, an optional leading
+// separator included.
+fn s_take_name_list(var c: SCur, sep: Str) -> [Str]
+    var out: [Str] = []
+    var more = true
+    s_eat(var c, sep)
+    while more and not s_failed(c) and s_kind(c) == "name"
+        out = list.push(out, s_want_name(var c, "a name"))
+        if not s_eat(var c, sep)
+            more = false
+    out
+
+fn s_take_field_lines(var c: SCur) -> [GqlFieldDef]
+    var out: [GqlFieldDef] = []
+    if not s_eat(var c, "{")
+        return out
+    while not s_failed(c) and not s_on(c, "}")
+        if s_at_end(c)
+            s_fail(var c, "a field list that runs to the end of the document")
+        else
+            let desc = s_take_description(var c)
+            let nm = s_want_name(var c, "a field name")
+            let args = s_take_arg_lines(var c)
+            var tr = gqllang.named_type("")
+            if s_eat(var c, ":")
+                tr = s_take_type(var c)
+            else
+                s_fail(var c, "expected `:` after the field name")
+            let dirs = s_take_directives(var c)
+            out = list.push(out, GqlFieldDef { name: nm, description: desc, args: args,
+                                               type_ref: tr, deprecated: s_deprecated_reason(dirs),
+                                               directives: dirs })
+    s_want(var c, "}")
+    out
+
+// `(name: Type = default @dir)`, a field's arguments.
+fn s_take_arg_lines(var c: SCur) -> [GqlArgDef]
+    var out: [GqlArgDef] = []
+    if not s_eat(var c, "(")
+        return out
+    while not s_failed(c) and not s_on(c, ")")
+        if s_at_end(c)
+            s_fail(var c, "an argument list that runs to the end of the document")
+        else
+            out = list.push(out, s_arg_line(var c))
+    s_want(var c, ")")
+    out
+
+// One argument, with its type and its default.
+fn s_arg_line(var c: SCur) -> GqlArgDef
+    let desc = s_take_description(var c)
+    let nm = s_want_name(var c, "an argument name")
+    var tr = gqllang.named_type("")
+    if s_eat(var c, ":")
+        tr = s_take_type(var c)
+    else
+        s_fail(var c, "expected `:` after the argument name")
+    var def: ?gqllang.GqlValueNode = None
+    if s_eat(var c, "=")
+        def = s_take_value(var c)
+    let dirs = s_take_directives(var c)
+    GqlArgDef { name: nm, description: desc, type_ref: tr, default_value: def,
+                deprecated: s_deprecated_reason(dirs), directives: dirs }
+
+// An input object's fields: an argument's shape without the
+// parentheses, which is why they are a second loop rather than one
+// function with a flag.
+fn s_take_input_lines(var c: SCur) -> [GqlArgDef]
+    var out: [GqlArgDef] = []
+    if not s_eat(var c, "{")
+        return out
+    while not s_failed(c) and not s_on(c, "}")
+        if s_at_end(c)
+            s_fail(var c, "an input field list that runs to the end of the document")
+        else
+            out = list.push(out, s_arg_line(var c))
+    s_want(var c, "}")
+    out
+
+fn s_take_enum_lines(var c: SCur) -> [GqlEnumValueDef]
+    var out: [GqlEnumValueDef] = []
+    if not s_eat(var c, "{")
+        return out
+    while not s_failed(c) and not s_on(c, "}")
+        if s_at_end(c)
+            s_fail(var c, "an enum value list that runs to the end of the document")
+        else
+            let desc = s_take_description(var c)
+            let nm = s_want_name(var c, "an enum value name")
+            let dirs = s_take_directives(var c)
+            out = list.push(out, GqlEnumValueDef { name: nm, description: desc,
+                                                   deprecated: s_deprecated_reason(dirs),
+                                                   directives: dirs })
+    s_want(var c, "}")
+    out
+
+// The `@deprecated` reason, or empty where the directive is absent.
+// The specification gives `@deprecated` a DEFAULT reason, which is why
+// a bare `@deprecated` is not the same as no directive.
+fn s_deprecated_reason(dirs: [gqllang.GqlDirectiveNode]) -> Str
+    var out = ""
+    for d in dirs
+        if d.name == "deprecated"
+            out = s_directive_arg_text(d, "reason")
+            if str.len(out) == 0
+                out = "No longer supported"
+    out
+
+fn s_directive_arg_text(d: gqllang.GqlDirectiveNode, arg: Str) -> Str
+    var out = ""
+    for a in d.args
+        if a.name == arg
+            out = a.value.text
+    out
+
+// One type definition, its keyword already at the cursor.
+fn s_take_type_def(var c: SCur, desc: Str) -> GqlTypeDef
+    let start = s_bump(var c)
+    let word = start.text
+    let nm = s_want_name(var c, "a type name")
+    var ifaces: [Str] = []
+    if s_is_word(c, "implements")
+        s_bump(var c)
+        ifaces = s_take_name_list(var c, "&")
+    var members: [Str] = []
+    var fields: [GqlFieldDef] = []
+    var inputs: [GqlArgDef] = []
+    var values: [GqlEnumValueDef] = []
+    var dirs: [gqllang.GqlDirectiveNode] = []
+    match word
+        "type" | "interface" =>
+            dirs = s_take_directives(var c)
+            fields = s_take_field_lines(var c)
+        "input"              =>
+            dirs = s_take_directives(var c)
+            inputs = s_take_input_lines(var c)
+        "enum"               =>
+            dirs = s_take_directives(var c)
+            values = s_take_enum_lines(var c)
+        "union"              =>
+            if s_eat(var c, "=")
+                members = s_take_name_list(var c, "|")
+            dirs = s_take_directives(var c)
+        _                    =>
+            dirs = s_take_directives(var c)
+    var specified = ""
+    if word == "scalar"
+        specified = s_directive_arg_text_in(dirs, "specifiedBy", "url")
+    GqlTypeDef { kind: s_kind_of_word(word), name: nm, description: desc, fields: fields,
+                 input_fields: inputs, enum_values: values, interfaces: ifaces,
+                 members: members, specified_by: specified, directives: dirs,
+                 loc: GqlLoc { line: start.line, column: start.col } }
+
+fn s_directive_arg_text_in(dirs: [gqllang.GqlDirectiveNode], directive: Str, arg: Str) -> Str
+    var out = ""
+    for d in dirs
+        if d.name == directive
+            out = s_directive_arg_text(d, arg)
+    out
+
+fn s_kind_of_word(word: Str) -> GqlTypeKind
+    match word
+        "scalar"    => GqlScalar
+        "enum"      => GqlEnum
+        "interface" => GqlInterface
+        "union"     => GqlUnion
+        "input"     => GqlInputObject
+        _           => GqlObject
+
+// `schema { query: Query }`.
+fn s_take_roots(var c: SCur) -> GqlRoots
+    s_bump(var c)
+    s_take_directives(var c)
+    var q = ""
+    var m = ""
+    var sub = ""
+    if s_eat(var c, "{")
+        while not s_failed(c) and not s_on(c, "}")
+            if s_at_end(c)
+                s_fail(var c, "a schema definition that runs to the end of the document")
+            else
+                let which = s_want_name(var c, "an operation kind")
+                if not s_eat(var c, ":")
+                    s_fail(var c, "expected `:` after the operation kind")
+                else
+                    let tn = s_want_name(var c, "a type name")
+                    match which
+                        "query"        =>
+                            q = tn
+                        "mutation"     =>
+                            m = tn
+                        "subscription" =>
+                            sub = tn
+                        _              => s_fail(var c, "`" + which + "` is not an operation kind")
+        s_want(var c, "}")
+    GqlRoots { query: q, mutation: m, subscription: sub }
+
+// `directive @name(args) repeatable on LOCATION | LOCATION`.
+fn s_take_directive_def(var c: SCur, desc: Str) -> GqlDirectiveDef
+    s_bump(var c)
+    if s_on(c, "@")
+        s_bump(var c)
+    let nm = s_want_name(var c, "a directive name")
+    let args = s_take_arg_lines(var c)
+    var repeatable = false
+    if s_is_word(c, "repeatable")
+        s_bump(var c)
+        repeatable = true
+    var locs: [Str] = []
+    if s_is_word(c, "on")
+        s_bump(var c)
+        locs = s_take_name_list(var c, "|")
+    GqlDirectiveDef { name: nm, description: desc, args: args, locations: locs,
+                      repeatable: repeatable }
+
+// The words a type definition may start with.
+fn s_is_type_word(word: Str) -> Bool
+    word == "type" or word == "interface" or word == "input" or word == "enum"
+        or word == "union" or word == "scalar"
+
+fn parse_sdl(var c: SCur) -> SdlParsed
+    var types: [GqlTypeDef] = []
+    var dirs: [GqlDirectiveDef] = []
+    var q = ""
+    var m = ""
+    var sub = ""
+    while not s_failed(c) and not s_at_end(c)
+        let desc = s_take_description(var c)
+        if s_kind(c) != "name"
+            s_fail(var c, "expected a type definition")
+        else
+            let word = s_say(c)
+            match word
+                _ if s_is_type_word(word)                          =>
+                    types = list.push(types, s_take_type_def(var c, desc))
+                "directive"                                        =>
+                    dirs = list.push(dirs, s_take_directive_def(var c, desc))
+                "schema"                                           =>
+                    let roots = s_take_roots(var c)
+                    q = roots.query
+                    m = roots.mutation
+                    sub = roots.subscription
+                "extend"                                           =>
+                    s_bump(var c)
+                    let what = s_say(c)
+                    if s_is_type_word(what)
+                        let addition = s_take_type_def(var c, "")
+                        types = s_merge_extension(var c, types, addition)
+                    elif what == "schema"
+                        let roots = s_take_roots(var c)
+                        if str.len(q) == 0
+                            q = roots.query
+                        if str.len(m) == 0
+                            m = roots.mutation
+                        if str.len(sub) == 0
+                            sub = roots.subscription
+                    else
+                        s_fail(var c, "`extend` needs a type definition or a schema definition after it")
+                "query" | "mutation" | "subscription" | "fragment" =>
+                    s_fail(var c,
+                        "`" + word + "` is an executable definition, and this entry point parses a schema")
+                _                                                  => s_fail(var c, "expected a type definition")
+    SdlParsed { types: types, directives: dirs, query_type: q, mutation_type: m,
+                subscription_type: sub }
+
+// An `extend` merges into the definition it names, because that is
+// what it means: one type, written in two places.  A name with no
+// definition to extend is refused, since the extension would be the
+// only half of a type.
+fn s_merge_extension(var c: SCur, types: [GqlTypeDef], addition: GqlTypeDef) -> [GqlTypeDef]
+    var out: [GqlTypeDef] = []
+    var found = false
+    for t in types
+        if t.name == addition.name
+            found = true
+            out = list.push(out, s_extended(t, addition))
+        else
+            out = list.push(out, t)
+    if not found
+        s_fail(var c, "`extend` names a type that is not defined")
+    out
+
+fn s_extended(t: GqlTypeDef, addition: GqlTypeDef) -> GqlTypeDef
+    GqlTypeDef { kind: t.kind, name: t.name, description: t.description,
+                 fields: list.concat(t.fields, addition.fields),
+                 input_fields: list.concat(t.input_fields, addition.input_fields),
+                 enum_values: list.concat(t.enum_values, addition.enum_values),
+                 interfaces: list.concat(t.interfaces, addition.interfaces),
+                 members: list.concat(t.members, addition.members),
+                 specified_by: t.specified_by,
+                 directives: list.concat(t.directives, addition.directives),
+                 loc: t.loc }
+
+// One exit rather than an early `return` on the faulted path: on this
+// toolchain an early return skips the release of a call-bound local
+// whose last use the tail moves into the answer, so `parsed` leaked a
+// whole `SdlParsed` per refused document — every verdict green and
+// `the run leaked`, exit 23.  The guard can be a `return` again on a
+// toolchain that releases the local.
+fn sdl_from_tokens(toks: [STok], source: Str) -> Result<SdlParsed, gqlerr.GqlFault>
+    var c = SCur { toks: toks, src: source, i: 0, fault: None }
+    let parsed = parse_sdl(var c)
+    if s_failed(c)
+        Err(s_the_fault(c))
+    else
+        Ok(parsed)
+
+fn sdl_document(source: Str) -> Result<SdlParsed, gqlerr.GqlFault> []
+    let toks = s_lex(source)!
+    sdl_from_tokens(toks, source)
+
+// ── The built-ins ────────────────────────────────────────────────────
+
+fn builtin_scalar_def(name: Str) -> GqlTypeDef
+    GqlTypeDef { kind: GqlScalar, name: name, description: "", fields: [],
+                 input_fields: [], enum_values: [], interfaces: [], members: [],
+                 specified_by: "", directives: [], loc: GqlLoc { line: 0, column: 0 } }
+
+fn builtin_directive_def(name: Str) -> GqlDirectiveDef
+    if name == "skip"
+        return GqlDirectiveDef { name: name, description: "", args: [builtin_arg_def("if", "Boolean", true, "")],
+                                 locations: ["FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"],
+                                 repeatable: false }
+    if name == "include"
+        return GqlDirectiveDef { name: name, description: "", args: [builtin_arg_def("if", "Boolean", true, "")],
+                                 locations: ["FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"],
+                                 repeatable: false }
+    if name == "deprecated"
+        return GqlDirectiveDef { name: name, description: "",
+                                 args: [builtin_arg_def("reason", "String", false, "No longer supported")],
+                                 locations: ["FIELD_DEFINITION", "ARGUMENT_DEFINITION",
+                                             "INPUT_FIELD_DEFINITION", "ENUM_VALUE"],
+                                 repeatable: false }
+    if name == "specifiedBy"
+        return GqlDirectiveDef { name: name, description: "", args: [builtin_arg_def("url", "String", true, "")],
+                                 locations: ["SCALAR"], repeatable: false }
+    // cov: skip — the one caller loops over `builtin_directives()`, whose four names are all answered above, so no other name reaches this line
+    GqlDirectiveDef { name: name, description: "", args: [], locations: [], repeatable: false }
+
+// One argument of a built-in directive.
+//
+// The built-ins' locations and arguments are PART of the interface: a
+// validator that accepted `me @skip` without an `if` would accept a
+// document no server can execute, and one that refused `@skip` on an
+// inline fragment would refuse a document every server executes.
+fn builtin_arg_def(name: Str, type_name: Str, non_null: Bool, default_text: Str) -> GqlArgDef
+    GqlArgDef { name: name, description: "",
+                type_ref: GqlTypeRef { name: type_name, list_depth: 0, non_null: [non_null] },
+                default_value: builtin_default(default_text), deprecated: "", directives: [] }
+
+// A built-in argument's default, where it has one.
+fn builtin_default(text: Str) -> ?gqllang.GqlValueNode
+    if str.len(text) == 0
+        return None
+    Some(GqlValueNode { kind: builtin_default_kind(text), text: text, items: [], names: [],
+                        loc: GqlLoc { line: 0, column: 0 } })
+
+// Which literal kind a built-in default is written with, so a printer
+// prints `false` and not `"false"`.
+fn builtin_default_kind(text: Str) -> Str
+    if text == "true" or text == "false"
+        return "boolean"
+    "string"
+
+// ── The meta-types (§ 4.5) ───────────────────────────────────────────
+
+// A named type with no wrappers.
+fn meta_ref(name: Str, non_null: Bool) -> gqllang.GqlTypeRef
+    GqlTypeRef { name: name, list_depth: 0, non_null: [non_null] }
+
+// `[T!]!`, which every meta-field that answers a list of its own
+// answers.
+fn meta_list_ref(name: Str) -> gqllang.GqlTypeRef
+    GqlTypeRef { name: name, list_depth: 1, non_null: [true, true] }
+
+// `[T!]`, which `__Type.fields` and its three siblings answer — a
+// nullable list of non-null members, and the asymmetry is § 4.5's.
+fn meta_bare_list_ref(name: Str) -> gqllang.GqlTypeRef
+    GqlTypeRef { name: name, list_depth: 1, non_null: [true, false] }
+
+// `includeDeprecated: Boolean = false`, which § 4.5 puts on four of the
+// meta-fields.
+fn meta_deprecated_arg() -> GqlArgDef
+    builtin_arg_def("includeDeprecated", "Boolean", false, "false")
+
+fn meta_field_def(name: Str, t: gqllang.GqlTypeRef, args: [GqlArgDef]) -> GqlFieldDef
+    GqlFieldDef { name: name, description: "", args: args, type_ref: t,
+                  deprecated: "", directives: [] }
+
+fn meta_object(name: Str, fields: [GqlFieldDef]) -> GqlTypeDef
+    GqlTypeDef { kind: GqlObject, name: name, description: "", fields: fields,
+                 input_fields: [], enum_values: [], interfaces: [], members: [],
+                 specified_by: "", directives: [], loc: GqlLoc { line: 0, column: 0 } }
+
+fn meta_enum(name: Str, values: [Str]) -> GqlTypeDef
+    var vs: [GqlEnumValueDef] = []
+    for v in values
+        vs = list.push(vs, GqlEnumValueDef { name: v, description: "", deprecated: "",
+                                             directives: [] })
+    GqlTypeDef { kind: GqlEnum, name: name, description: "", fields: [],
+                 input_fields: [], enum_values: vs, interfaces: [], members: [],
+                 specified_by: "", directives: [], loc: GqlLoc { line: 0, column: 0 } }
+
+// § 4.5's eight meta-types, as ordinary definitions.
+//
+// THEY ARE PART OF THE SCHEMA A QUERY IS VALIDATED AGAINST and NOT part
+// of the schema a deployment wrote: `type_named` answers them, so
+// `{ __schema { types { name } } }` validates and executes, while
+// `s.types` — which a printer, a diff and a deprecation report walk —
+// holds the deployment's own types and nothing else.
+//
+// Modelling them rather than special-casing them is what keeps the
+// validator from having an opinion about introspection that the
+// executor does not share.
+fn meta_types() -> [GqlTypeDef]
+    [meta_object("__Schema",
+        [meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("types", meta_list_ref("__Type"), []),
+          meta_field_def("queryType", meta_ref("__Type", true), []),
+          meta_field_def("mutationType", meta_ref("__Type", false), []),
+          meta_field_def("subscriptionType", meta_ref("__Type", false), []),
+          meta_field_def("directives", meta_list_ref("__Directive"), [])]),
+      meta_object("__Type",
+        [meta_field_def("kind", meta_ref("__TypeKind", true), []),
+          meta_field_def("name", meta_ref("String", false), []),
+          meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("specifiedByURL", meta_ref("String", false), []),
+          meta_field_def("fields", meta_bare_list_ref("__Field"), [meta_deprecated_arg()]),
+          meta_field_def("interfaces", meta_bare_list_ref("__Type"), []),
+          meta_field_def("possibleTypes", meta_bare_list_ref("__Type"), []),
+          meta_field_def("enumValues", meta_bare_list_ref("__EnumValue"), [meta_deprecated_arg()]),
+          meta_field_def("inputFields", meta_bare_list_ref("__InputValue"), [meta_deprecated_arg()]),
+          meta_field_def("ofType", meta_ref("__Type", false), [])]),
+      meta_object("__Field",
+        [meta_field_def("name", meta_ref("String", true), []),
+          meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("args", meta_list_ref("__InputValue"), [meta_deprecated_arg()]),
+          meta_field_def("type", meta_ref("__Type", true), []),
+          meta_field_def("isDeprecated", meta_ref("Boolean", true), []),
+          meta_field_def("deprecationReason", meta_ref("String", false), [])]),
+      meta_object("__InputValue",
+        [meta_field_def("name", meta_ref("String", true), []),
+          meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("type", meta_ref("__Type", true), []),
+          meta_field_def("defaultValue", meta_ref("String", false), []),
+          meta_field_def("isDeprecated", meta_ref("Boolean", true), []),
+          meta_field_def("deprecationReason", meta_ref("String", false), [])]),
+      meta_object("__EnumValue",
+        [meta_field_def("name", meta_ref("String", true), []),
+          meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("isDeprecated", meta_ref("Boolean", true), []),
+          meta_field_def("deprecationReason", meta_ref("String", false), [])]),
+      meta_object("__Directive",
+        [meta_field_def("name", meta_ref("String", true), []),
+          meta_field_def("description", meta_ref("String", false), []),
+          meta_field_def("isRepeatable", meta_ref("Boolean", true), []),
+          meta_field_def("locations", meta_list_ref("__DirectiveLocation"), []),
+          meta_field_def("args", meta_list_ref("__InputValue"), [meta_deprecated_arg()])]),
+      meta_enum("__TypeKind",
+        ["SCALAR", "OBJECT", "INTERFACE", "UNION", "ENUM", "INPUT_OBJECT", "LIST", "NON_NULL"]),
+      meta_enum("__DirectiveLocation",
+        ["QUERY", "MUTATION", "SUBSCRIPTION", "FIELD", "FRAGMENT_DEFINITION",
+         "FRAGMENT_SPREAD", "INLINE_FRAGMENT", "VARIABLE_DEFINITION", "SCHEMA",
+         "SCALAR", "OBJECT", "FIELD_DEFINITION", "ARGUMENT_DEFINITION", "INTERFACE",
+         "UNION", "ENUM", "ENUM_VALUE", "INPUT_OBJECT", "INPUT_FIELD_DEFINITION"])]
+
+fn meta_type_def(name: Str) -> ?GqlTypeDef
+    var found: ?GqlTypeDef = None
+    for t in meta_types()
+        if found == None and t.name == name
+            found = Some(t)
+    found
+
+// A type of the schema, or one of § 4.5's meta-types.
+//
+// The one place the two tables meet, so the validator, the executor and
+// the introspection module cannot disagree about whether `__Type` is
+// defined.
+fn type_or_meta(s: GqlSchema, name: Str) -> ?GqlTypeDef
+    match find_type(s.types, name)
+        Some(t) => Some(t)
+        None    => meta_type_def(name)
+
+fn is_builtin_scalar_name(name: Str) -> Bool
+    list.contains(builtin_scalars(), name)
+
+fn is_builtin_directive_name(name: Str) -> Bool
+    list.contains(builtin_directives(), name)
+
+// ── Asking a schema questions ────────────────────────────────────────
+
+// The specification's own word for a kind, which is also what
+// introspection's `__Type.kind` answers.
+fn kind_word(k: GqlTypeKind) -> Str
+    match k
+        GqlScalar      => "SCALAR"
+        GqlEnum        => "ENUM"
+        GqlObject      => "OBJECT"
+        GqlInterface   => "INTERFACE"
+        GqlUnion       => "UNION"
+        GqlInputObject => "INPUT_OBJECT"
+
+// The keyword a type definition is WRITTEN with.
+//
+// Not `kind_word`: § 4.5's `__Type.kind` answers `OBJECT` and
+// `INPUT_OBJECT`, and the schema language writes those two `type` and
+// `input`.  A printer that reused the introspection word emitted
+// `object Query { ... }` — a document this package's own `parse`
+// refuses.
+fn sdl_word(k: GqlTypeKind) -> Str
+    match k
+        // cov: skip — `print_type_def` answers a SCALAR before it builds the head that calls this, so a scalar never arrives here
+        GqlScalar      => "scalar"
+        GqlEnum        => "enum"
+        GqlObject      => "type"
+        GqlInterface   => "interface"
+        // cov: skip — and it answers a UNION the same way, for the same reason
+        GqlUnion       => "union"
+        GqlInputObject => "input"
+
+fn find_type(types: [GqlTypeDef], name: Str) -> ?GqlTypeDef
+    var found: ?GqlTypeDef = None
+    for t in types
+        if found == None and t.name == name
+            found = Some(t)
+    found
+
+fn find_field(fields: [GqlFieldDef], name: Str) -> ?GqlFieldDef
+    var found: ?GqlFieldDef = None
+    for f in fields
+        if found == None and f.name == name
+            found = Some(f)
+    found
+
+fn find_arg(args: [GqlArgDef], name: Str) -> ?GqlArgDef
+    var found: ?GqlArgDef = None
+    for a in args
+        if found == None and a.name == name
+            found = Some(a)
+    found
+
+fn find_enum_value(values: [GqlEnumValueDef], name: Str) -> ?GqlEnumValueDef
+    var found: ?GqlEnumValueDef = None
+    for v in values
+        if found == None and v.name == name
+            found = Some(v)
+    found
+
+// A type with no wrappers, marked non-null: what a meta-field's type is.
+fn required_type(name: Str) -> gqllang.GqlTypeRef
+    GqlTypeRef { name: name, list_depth: 0, non_null: [true] }
+
+// The meta-field, where one of the three applies to this type.
+//
+// `__typename` is on every composite type; `__schema` and `__type` are
+// on the query root and nowhere else.  Answering them here is what
+// keeps the validator and the executor from each deciding for
+// themselves.
+fn meta_field(s: GqlSchema, t: GqlTypeDef, field: Str) -> ?GqlFieldDef
+    if field == "__typename" and is_composite(s, t.name)
+        return Some(GqlFieldDef { name: "__typename", description: "The name of the type this value is",
+                                  args: [], type_ref: required_type("String"), deprecated: "",
+                                  directives: [] })
+    if t.name != s.query_type
+        return None
+    if field == "__schema"
+        return Some(GqlFieldDef { name: "__schema", description: "The schema this service implements",
+                                  args: [], type_ref: required_type("__Schema"), deprecated: "",
+                                  directives: [] })
+    if field == "__type"
+        return Some(GqlFieldDef { name: "__type", description: "A type of the schema, by name",
+                                  args: [GqlArgDef { name: "name", description: "",
+                                                     type_ref: required_type("String"),
+                                                     default_value: None, deprecated: "",
+                                                     directives: [] }],
+                                  type_ref: gqllang.named_type("__Type"), deprecated: "",
+                                  directives: [] })
+    None
+
+// The interface names a type implements, following the ones its
+// interfaces implement — the 2021 addition, and the reason
+// conformance is a walk.
+fn interface_closure(s: GqlSchema, t: GqlTypeDef, seen: [Str]) -> [Str]
+    var out: [Str] = []
+    for i in t.interfaces
+        if not list.contains(seen, i)
+            out = list.push(out, i)
+            let parent = find_type(s.types, i)
+            if let Some(p) = parent
+                let more = interface_closure(s, p, list.push(list.clone(seen), i))
+                for n in more
+                    if not list.contains(out, n)
+                        out = list.push(out, n)
+    out
+
+fn implements_transitively(s: GqlSchema, t: GqlTypeDef, target: Str) -> Bool
+    list.contains(interface_closure(s, t, []), target)
+
+// ── Building ─────────────────────────────────────────────────────────
+
+// Names that cannot coexist: a duplicate, a reserved one, and one that
+// shadows a built-in scalar.
+fn name_problems(types: [GqlTypeDef], directives: [GqlDirectiveDef]) -> [Str]
+    var out: [Str] = []
+    for t in types
+        if is_reserved_name(t.name)
+            out = list.push(out,
+                "the type `" + t.name + "` has two leading underscores, which § 3.3 reserves for introspection")
+        if is_builtin_scalar_name(t.name)
+            out = list.push(out,
+                "the name `" + t.name + "` is a built-in scalar, and a schema may not redefine one")
+    out = list.concat(out, duplicate_type_names(types))
+    out = list.concat(out, duplicate_directive_names(directives))
+    out
+
+fn duplicate_type_names(types: [GqlTypeDef]) -> [Str]
+    var out: [Str] = []
+    var seen: [Str] = []
+    for t in types
+        if list.contains(seen, t.name)
+            out = list.push(out, "the type `" + t.name + "` is defined more than once")
+        else
+            seen = list.push(seen, t.name)
+    out
+
+fn duplicate_directive_names(dirs: [GqlDirectiveDef]) -> [Str]
+    var out: [Str] = []
+    var seen: [Str] = []
+    for d in dirs
+        if list.contains(seen, d.name)
+            out = list.push(out, "the directive `@" + d.name + "` is defined more than once")
+        else
+            seen = list.push(seen, d.name)
+    out
+
+// Every reference a schema makes, checked: a field's type is an output
+// type, an argument's is an input type, a member is an object, an
+// implemented interface is an interface, every one of them exists, and
+// an implementor satisfies what it claims.
+fn reference_problems(s: GqlSchema) -> [Str]
+    var out: [Str] = []
+    for t in s.types
+        out = list.concat(out, type_reference_problems(s, t))
+    out
+
+fn type_reference_problems(s: GqlSchema, t: GqlTypeDef) -> [Str]
+    var out: [Str] = []
+    for f in t.fields
+        out = list.concat(out, output_type_problems(s, t.name + "." + f.name, f.type_ref.name))
+        for a in f.args
+            out = list.concat(out,
+                input_type_problems(s, t.name + "." + f.name + "(" + a.name + ")", a.type_ref.name))
+            // An argument carries directives and `ARGUMENT_DEFINITION` is
+            // a location § 3.13 names, so an argument's directive is a
+            // reference like any other; checking the field's and not the
+            // argument's refused `me: String @nope` and accepted
+            // `me(a: String @nope): String`.
+            out = list.concat(out, directive_problems(s, a.directives))
+        out = list.concat(out, directive_problems(s, f.directives))
+    for a in t.input_fields
+        out = list.concat(out, input_type_problems(s, t.name + "." + a.name, a.type_ref.name))
+        out = list.concat(out, directive_problems(s, a.directives))
+    for v in t.enum_values
+        out = list.concat(out, directive_problems(s, v.directives))
+    for m in t.members
+        out = list.concat(out, member_problems(s, t, m))
+    for i in t.interfaces
+        out = list.concat(out, implements_problems(s, t, i))
+    out = list.concat(out, directive_problems(s, t.directives))
+    out
+
+fn output_type_problems(s: GqlSchema, where_text: Str, name: Str) -> [Str]
+    if str.len(name) == 0
+        return []
+    if find_type(s.types, name) == None
+        return ["the type `" + name + "`, which " + where_text + " is written with, is not defined"]
+    if is_output_type(s, name)
+        return []
+    ["the type `" + name + "`, which " + where_text + " is written with, cannot be an output type"]
+
+fn input_type_problems(s: GqlSchema, where_text: Str, name: Str) -> [Str]
+    if str.len(name) == 0
+        return []
+    if find_type(s.types, name) == None
+        return ["the type `" + name + "`, which " + where_text + " is written with, is not defined"]
+    if is_input_type(s, name)
+        return []
+    ["the type `" + name + "`, which " + where_text + " is written with, cannot be an input type"]
+
+fn member_problems(s: GqlSchema, t: GqlTypeDef, member: Str) -> [Str]
+    match find_type(s.types, member)
+        None    => ["the union `" + t.name + "` has the member `" + member + "`, which is not defined"]
+        Some(m) =>
+            if kind_word(m.kind) != "OBJECT"
+                ["the union `" + t.name + "` has the member `" + member + "`, which is not an object type"]
+            else
+                []
+
+fn implements_problems(s: GqlSchema, t: GqlTypeDef, iface: Str) -> [Str]
+    match find_type(s.types, iface)
+        None    => ["the type `" + t.name + "` implements `" + iface + "`, which is not defined"]
+        Some(i) =>
+            if kind_word(i.kind) != "INTERFACE"
+                ["the type `" + t.name + "` implements `" + iface + "`, which is not an interface"]
+            else
+                conformance_problems(s, t, iface, i)
+
+fn conformance_problems(s: GqlSchema, t: GqlTypeDef, iface: Str, i2: GqlTypeDef) -> [Str]
+    var out: [Str] = []
+    for field in i2.fields
+        match find_field(t.fields, field.name)
+            None      =>
+                out = list.push(out,
+                    "the type `" + t.name + "` implements `" + iface + "` and does not declare its field `" + field.name + "`")
+            Some(own) =>
+                if not field_satisfies(own.type_ref, field.type_ref)
+                    out = list.push(out,
+                        "the type `" + t.name + "` declares `" + field.name + "` as `" + gqllang.print_type(own.type_ref) + "`, which `" + iface + "` does not allow: it says `" + gqllang.print_type(field.type_ref) + "`")
+    // § 3.6: an implementor must declare every interface its interfaces
+    // implement, which is what makes the 2021 chain a declaration as
+    // well as a walk.
+    let ancestors = interface_closure(s, i2, [iface])
+    for a in ancestors
+        if not list.contains(t.interfaces, a)
+            out = list.push(out,
+                "the type `" + t.name + "` implements `" + iface + "`, so it must also declare that it implements `" + a + "`")
+    out
+
+// Whether an implementor's field type satisfies the interface's: the
+// same type, and non-null wherever the interface is — a strengthening
+// is allowed and a weakening is not.
+fn field_satisfies(own: gqllang.GqlTypeRef, required: gqllang.GqlTypeRef) -> Bool
+    if own.name != required.name
+        return false
+    if own.list_depth != required.list_depth
+        return false
+    for k in 0..=required.list_depth
+        if list.get(required.non_null, k, false) and not list.get(own.non_null, k, false)
+            return false
+    true
+
+fn directive_problems(s: GqlSchema, dirs: [gqllang.GqlDirectiveNode]) -> [Str]
+    var out: [Str] = []
+    for d in dirs
+        if not is_builtin_directive_name(d.name) and find_directive(s.directives, d.name) == None
+            out = list.push(out, "the directive `@" + d.name + "` is not defined")
+    out
+
+fn find_directive(dirs: [GqlDirectiveDef], name: Str) -> ?GqlDirectiveDef
+    var found: ?GqlDirectiveDef = None
+    for d in dirs
+        if found == None and d.name == name
+            found = Some(d)
+    found
+
+// ── Printing ─────────────────────────────────────────────────────────
+
+fn cat_sdl(parts: [Str]) -> Str
+    str.join(parts, "")
+
+fn pad_sdl(n: Int) -> Str
+    str.repeat("  ", n)
+
+fn described(text: Str, body: Str) -> Str
+    if str.len(text) == 0
+        return body
+    cat_sdl([block_string(text), "\n", body])
+
+// A description, as a block string, with the one escape a block string
+// has: a literal `"""` is written `\"""`.
+fn block_string(text: Str) -> Str
+    let safe = str.replace(text, "\"\"\"", "\\\"\"\"")
+    cat_sdl(["\"\"\"", safe, "\"\"\""])
+
+fn print_directive_text(d: gqllang.GqlDirectiveNode) -> Str
+    var parts: [Str] = list.map(d.args, a => cat_sdl([a.name, ": ", gqllang.print_value(a.value)]))
+    cat_sdl(["@", d.name, "(", str.join(parts, ", "), ")"])
+
+fn print_directives_text(dirs: [gqllang.GqlDirectiveNode]) -> Str
+    var out = ""
+    for d in dirs
+        out = cat_sdl([out, " ", print_directive_text(d)])
+    out
+
+fn print_input_list(items: [GqlArgDef], sep: Str) -> Str
+    if list.is_empty(items)
+        return ""
+    var parts: [Str] = list.map(items, a => print_arg_text(a))
+    cat_sdl([sep, str.join(parts, ", "), ")"])
+
+fn print_arg_text(a: GqlArgDef) -> Str
+    var out = cat_sdl([a.name, ": ", gqllang.print_type(a.type_ref)])
+    if let Some(dv) = a.default_value
+        out = cat_sdl([out, " = ", gqllang.print_value(dv)])
+    out = cat_sdl([out, print_directives_text(a.directives)])
+    out
+
+fn print_field_text(f: GqlFieldDef) -> Str
+    cat_sdl([f.name, print_input_list(f.args, "("), ": ",
+             gqllang.print_type(f.type_ref), print_directives_text(f.directives)])
+
+fn print_input_field_text(a: GqlArgDef) -> Str
+    cat_sdl([a.name, ": ", gqllang.print_type(a.type_ref), print_default_text(a),
+             print_directives_text(a.directives)])
+
+fn print_default_text(a: GqlArgDef) -> Str
+    var out = ""
+    if let Some(dv) = a.default_value
+        out = cat_sdl([" = ", gqllang.print_value(dv)])
+    out
+
+fn print_lines(items: [Str], indent: Int) -> Str
+    if list.is_empty(items)
+        return ""
+    var lines: [Str] = [" {"]
+    lines = list.concat(lines, list.map(items, line => cat_sdl([pad_sdl(indent + 1), line])))
+    lines = list.push(lines, cat_sdl([pad_sdl(indent), "}"]))
+    str.join(lines, "\n")
+
+fn print_type_def(t: GqlTypeDef, indent: Int) -> Str
+    let word = kind_word(t.kind)
+    if word == "SCALAR"
+        return described(t.description, cat_sdl(["scalar ", t.name, print_directives_text(t.directives)]))
+    if word == "UNION"
+        return described(t.description, cat_sdl(["union ", t.name, print_members_text(t.members),
+                                                 print_directives_text(t.directives)]))
+    var head = cat_sdl([sdl_word(t.kind), " ", t.name, print_implements_text(t.interfaces),
+                        print_directives_text(t.directives)])
+    if word == "ENUM"
+        var names: [Str] = list.map(t.enum_values, v => cat_sdl([v.name, print_directives_text(v.directives)]))
+        return described(t.description, cat_sdl([head, print_lines(names, indent)]))
+    if word == "INPUT_OBJECT"
+        var fields: [Str] = list.map(t.input_fields, a => print_input_field_text(a))
+        return described(t.description, cat_sdl([head, print_lines(fields, indent)]))
+    var members: [Str] = list.map(t.fields, f => print_field_text(f))
+    described(t.description, cat_sdl([head, print_lines(members, indent)]))
+
+fn print_implements_text(ifaces: [Str]) -> Str
+    if list.is_empty(ifaces)
+        return ""
+    cat_sdl([" implements ", str.join(ifaces, " & ")])
+
+// A union's member list, which is nothing at all when it has none.
+//
+// `union U = ` re-reads as a union that takes whatever the NEXT
+// definition starts with as a member, which is a type the deployment
+// did not write there.
+fn print_members_text(members: [Str]) -> Str
+    if list.is_empty(members)
+        return ""
+    cat_sdl([" = ", str.join(members, " | ")])
+
+fn print_schema_text(s: GqlSchema) -> Str
+    let sorted = list.sort_by(list.clone(s.types), t => t.name)
+    var parts: [Str] = []
+    for t in sorted
+        if not is_builtin_scalar_name(t.name)
+            parts = list.push(parts, print_type_def(t, 0))
+    var dirs: [GqlDirectiveDef] = []
+    for d in s.directives
+        if not is_builtin_directive_name(d.name)
+            dirs = list.push(dirs, d)
+    parts = list.concat(parts, list.map(dirs, d => print_directive_def(d)))
+    str.join(parts, "\n")
+
+fn print_directive_def(d: GqlDirectiveDef) -> Str
+    var out = cat_sdl(["directive @", d.name, print_input_list(d.args, "(")])
+    if d.repeatable
+        out = cat_sdl([out, " repeatable"])
+    if list.len(d.locations) > 0
+        out = cat_sdl([out, " on ", str.join(d.locations, " | ")])
+    described(d.description, out)
+
 // ── Parsing and building ─────────────────────────────────────────────
 
 // SDL parsed into type definitions, WITHOUT the resolution step.
@@ -161,7 +1422,8 @@ pub struct GqlSchema
 //         Err(_) => println("not SDL")
 // ```
 pub fn parse(source: Str) -> Result<[GqlTypeDef], gqlerr.GqlFault> []
-    todo("graphql-nv.gqlsdl.parse")
+    let parsed = sdl_document(source)!
+    Ok(list.clone(parsed.types))
 
 // SDL parsed AND resolved into a schema.
 //
@@ -179,7 +1441,24 @@ pub fn parse(source: Str) -> Result<[GqlTypeDef], gqlerr.GqlFault> []
 //         Err(_) => println("that schema cannot exist")
 // ```
 pub fn build(source: Str) -> Result<GqlSchema, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlsdl.build")
+    let parsed = sdl_document(source)!
+    build_parsed(parsed)
+
+// The roots a document means: the ones a `schema` block named, and the
+// conventional names otherwise — § 3.3's rule, and not a guess, because
+// a type named `Query` IS the query root when nothing says otherwise.
+fn build_parsed(p: SdlParsed) -> Result<GqlSchema, gqlerr.GqlFault>
+    build_from(p.types, p.directives,
+               root_or(p.query_type, "Query", p.types),
+               root_or(p.mutation_type, "Mutation", p.types),
+               root_or(p.subscription_type, "Subscription", p.types))
+
+fn root_or(named: Str, conventional: Str, types: [GqlTypeDef]) -> Str
+    if str.len(named) > 0
+        return named
+    if find_type(types, conventional) != None
+        return conventional
+    ""
 
 // A schema built from definitions the caller assembled.
 //
@@ -200,7 +1479,29 @@ pub fn build(source: Str) -> Result<GqlSchema, gqlerr.GqlFault> []
 pub fn build_from(types: [GqlTypeDef], directives: [GqlDirectiveDef], query_type: Str,
                   mutation_type: Str,
                   subscription_type: Str) -> Result<GqlSchema, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlsdl.build_from")
+    var problems = name_problems(types, directives)
+    var full: [GqlTypeDef] = list.clone(types)
+    full = list.concat(full, list.map(builtin_scalars(), name => builtin_scalar_def(name)))
+    var dirs: [GqlDirectiveDef] = list.clone(directives)
+    dirs = list.concat(dirs, list.map(builtin_directives(), name => builtin_directive_def(name)))
+    let s = GqlSchema { types: full, directives: dirs, query_type: query_type,
+                        mutation_type: mutation_type, subscription_type: subscription_type,
+                        description: "" }
+    problems = list.concat(problems, reference_problems(s))
+    if str.len(query_type) == 0
+        problems = list.push(problems, "this schema has no query root type, and § 3.3 says a schema needs one")
+    if str.len(mutation_type) > 0 and not is_root_object(s, mutation_type)
+        problems = list.push(problems, "the mutation root `" + mutation_type + "` is not an object type")
+    if str.len(subscription_type) > 0 and not is_root_object(s, subscription_type)
+        problems = list.push(problems, "the subscription root `" + subscription_type + "` is not an object type")
+    if list.len(problems) > 0
+        return Err(GqlSchemaInvalid(str.join(problems, "\n")))
+    Ok(s)
+
+fn is_root_object(s: GqlSchema, name: Str) -> Bool
+    match find_type(s.types, name)
+        None    => false
+        Some(t) => kind_word(t.kind) == "OBJECT"
 
 // A schema printed back out as SDL, canonically.
 //
@@ -219,7 +1520,7 @@ pub fn build_from(types: [GqlTypeDef], directives: [GqlDirectiveDef], query_type
 //         Ok(s)  => println(gqlsdl.print_schema(s))
 // ```
 pub fn print_schema(s: GqlSchema) -> Str []
-    todo("graphql-nv.gqlsdl.print_schema")
+    print_schema_text(s)
 
 // ── Asking a schema questions ────────────────────────────────────────
 
@@ -237,7 +1538,7 @@ pub fn print_schema(s: GqlSchema) -> Str []
 //                 None    => println("no such type")
 // ```
 pub fn type_named(s: GqlSchema, name: Str) -> ?GqlTypeDef []
-    todo("graphql-nv.gqlsdl.type_named")
+    type_or_meta(s, name)
 
 // A field of a named type, or `None`.
 //
@@ -258,7 +1559,12 @@ pub fn type_named(s: GqlSchema, name: Str) -> ?GqlTypeDef []
 //                 None    => println("no such field")
 // ```
 pub fn field_named(s: GqlSchema, type_name: Str, field: Str) -> ?GqlFieldDef []
-    todo("graphql-nv.gqlsdl.field_named")
+    match type_or_meta(s, type_name)
+        None    => None
+        Some(t) =>
+            match find_field(t.fields, field)
+                Some(f) => Some(f)
+                None    => meta_field(s, t, field)
 
 // An argument of a field, or `None`.
 //
@@ -274,7 +1580,9 @@ pub fn field_named(s: GqlSchema, type_name: Str, field: Str) -> ?GqlFieldDef []
 //                 None    => println("no such argument")
 // ```
 pub fn arg_named(s: GqlSchema, type_name: Str, field: Str, arg: Str) -> ?GqlArgDef []
-    todo("graphql-nv.gqlsdl.arg_named")
+    match field_named(s, type_name, field)
+        None    => None
+        Some(f) => find_arg(f.args, arg)
 
 // The object types a type could be at run time.
 //
@@ -294,7 +1602,22 @@ pub fn arg_named(s: GqlSchema, type_name: Str, field: Str, arg: Str) -> ?GqlArgD
 //         Ok(s)  => println("${list.len(gqlsdl.possible_types(s, "Query"))}")
 // ```
 pub fn possible_types(s: GqlSchema, type_name: Str) -> [Str] []
-    todo("graphql-nv.gqlsdl.possible_types")
+    match type_or_meta(s, type_name)
+        None    => []
+        Some(t) => possible_types_of(s, t)
+
+fn possible_types_of(s: GqlSchema, t: GqlTypeDef) -> [Str]
+    let word = kind_word(t.kind)
+    match word
+        "OBJECT"    => [t.name]
+        "UNION"     => list.clone(t.members)
+        "INTERFACE" =>
+            var out: [Str] = []
+            for other in s.types
+                if kind_word(other.kind) == "OBJECT" and implements_transitively(s, other, t.name)
+                    out = list.push(out, other.name)
+            out
+        _           => []
 
 // Whether a value of `sub` is always a valid value of `sup`.
 //
@@ -312,7 +1635,20 @@ pub fn possible_types(s: GqlSchema, type_name: Str) -> [Str] []
 //         Ok(s)  => println("${gqlsdl.is_subtype(s, "Query", "Query")}")
 // ```
 pub fn is_subtype(s: GqlSchema, sub: Str, sup: Str) -> Bool []
-    todo("graphql-nv.gqlsdl.is_subtype")
+    if sub == sup
+        return true
+    match find_type(s.types, sup)
+        None     => false
+        Some(up) =>
+            if kind_word(up.kind) == "UNION"
+                return list.contains(up.members, sub)
+            match find_type(s.types, sub)
+                None      => false
+                Some(low) =>
+                    if kind_word(low.kind) == "OBJECT" or kind_word(low.kind) == "INTERFACE"
+                        implements_transitively(s, low, sup)
+                    else
+                        false
 
 // Whether a named type may appear as an INPUT (§ 3.10).
 //
@@ -330,7 +1666,7 @@ pub fn is_subtype(s: GqlSchema, sub: Str, sup: Str) -> Bool []
 //         Ok(s)  => println("${gqlsdl.is_input_type(s, "String")}")
 // ```
 pub fn is_input_type(s: GqlSchema, type_name: Str) -> Bool []
-    todo("graphql-nv.gqlsdl.is_input_type")
+    kind_is(s, type_name, ["SCALAR", "ENUM", "INPUT_OBJECT"])
 
 // Whether a named type may appear as an OUTPUT.
 //
@@ -343,7 +1679,12 @@ pub fn is_input_type(s: GqlSchema, type_name: Str) -> Bool []
 //         Ok(s)  => println("${gqlsdl.is_output_type(s, "Query")}")
 // ```
 pub fn is_output_type(s: GqlSchema, type_name: Str) -> Bool []
-    todo("graphql-nv.gqlsdl.is_output_type")
+    kind_is(s, type_name, ["SCALAR", "ENUM", "OBJECT", "INTERFACE", "UNION"])
+
+fn kind_is(s: GqlSchema, type_name: Str, words: [Str]) -> Bool
+    match type_or_meta(s, type_name)
+        None    => false
+        Some(t) => list.contains(words, kind_word(t.kind))
 
 // Whether a named type needs a selection set on it.
 //
@@ -361,7 +1702,7 @@ pub fn is_output_type(s: GqlSchema, type_name: Str) -> Bool []
 //         Ok(s)  => println("${gqlsdl.is_composite(s, "String")}")
 // ```
 pub fn is_composite(s: GqlSchema, type_name: Str) -> Bool []
-    todo("graphql-nv.gqlsdl.is_composite")
+    kind_is(s, type_name, ["OBJECT", "INTERFACE", "UNION"])
 
 // The five names § 3.5 reserves: `Int`, `Float`, `String`, `Boolean`,
 // `ID`.
@@ -378,7 +1719,7 @@ pub fn is_composite(s: GqlSchema, type_name: Str) -> Bool []
 //     println("${list.len(gqlsdl.builtin_scalars())}")
 // ```
 pub fn builtin_scalars() -> [Str] []
-    todo("graphql-nv.gqlsdl.builtin_scalars")
+    ["Int", "Float", "String", "Boolean", "ID"]
 
 // The three directives § 3.13.3 requires every schema to have:
 // `@skip`, `@include`, `@deprecated` — plus `@specifiedBy`, which the
@@ -396,7 +1737,7 @@ pub fn builtin_scalars() -> [Str] []
 //     println("${list.len(gqlsdl.builtin_directives())}")
 // ```
 pub fn builtin_directives() -> [Str] []
-    todo("graphql-nv.gqlsdl.builtin_directives")
+    ["skip", "include", "deprecated", "specifiedBy"]
 
 // Whether a name is reserved for introspection: two leading
 // underscores (§ 3.3).
@@ -410,7 +1751,7 @@ pub fn builtin_directives() -> [Str] []
 //     println("${gqlsdl.is_reserved_name("__Type")}")
 // ```
 pub fn is_reserved_name(name: Str) -> Bool []
-    todo("graphql-nv.gqlsdl.is_reserved_name")
+    str.starts_with(name, "__")
 
 // Every deprecated field and enum value in a schema, as
 // `Type.field` strings.
@@ -431,7 +1772,15 @@ pub fn is_reserved_name(name: Str) -> Bool []
 //         Ok(s)  => println("${list.len(gqlsdl.deprecations(s))}")
 // ```
 pub fn deprecations(s: GqlSchema) -> [Str] []
-    todo("graphql-nv.gqlsdl.deprecations")
+    var out: [Str] = []
+    for t in s.types
+        for f in t.fields
+            if str.len(f.deprecated) > 0
+                out = list.push(out, cat_sdl([t.name, ".", f.name]))
+        for v in t.enum_values
+            if str.len(v.deprecated) > 0
+                out = list.push(out, cat_sdl([t.name, ".", v.name]))
+    out
 
 // What a change from one schema to another BREAKS for a client.
 //
@@ -457,4 +1806,70 @@ pub fn deprecations(s: GqlSchema) -> [Str] []
 //         Ok(a)  => println("${list.len(gqlsdl.breaking_changes(a, a))}")
 // ```
 pub fn breaking_changes(before: GqlSchema, after: GqlSchema) -> [Str] []
-    todo("graphql-nv.gqlsdl.breaking_changes")
+    var out: [Str] = []
+    for t in before.types
+        let now = find_type(after.types, t.name)
+        if now == None
+            out = list.push(out, cat_sdl(["the type `", t.name, "` was removed"]))
+        else
+            let n = now ?? t
+            out = list.concat(out, type_breaks(t, n))
+    out
+
+fn type_breaks(a: GqlTypeDef, b: GqlTypeDef) -> [Str]
+    var out: [Str] = []
+    for f in a.fields
+        match find_field(b.fields, f.name)
+            None    =>
+                out = list.push(out, cat_sdl(["the field `", a.name, ".", f.name, "` was removed"]))
+            Some(g) =>
+                if not same_type(f.type_ref, g.type_ref) and narrowed(f.type_ref, g.type_ref)
+                    out = list.push(out, cat_sdl(["the type of `", a.name, ".", f.name, "` narrowed from `",
+                                                  gqllang.print_type(f.type_ref), "` to `",
+                                                  gqllang.print_type(g.type_ref), "`"]))
+                out = list.concat(out, arg_breaks(a.name, f, g))
+    for v in a.enum_values
+        if find_enum_value(b.enum_values, v.name) == None
+            out = list.push(out, cat_sdl(["the enum value `", a.name, ".", v.name, "` was removed"]))
+    for v in b.enum_values
+        if find_enum_value(a.enum_values, v.name) == None
+            out = list.push(out, cat_sdl(["the enum value `", a.name, ".", v.name,
+                                          "` was added, which breaks a client that matched every value"]))
+    for m in a.members
+        if not list.contains(b.members, m)
+            out = list.push(out, cat_sdl(["the union member `", a.name, ".", m, "` was removed"]))
+    for i in a.interfaces
+        if not list.contains(b.interfaces, i)
+            out = list.push(out, cat_sdl(["the type `", a.name, "` no longer implements `", i, "`"]))
+    out
+
+fn arg_breaks(type_name: Str, f: GqlFieldDef, g: GqlFieldDef) -> [Str]
+    var out: [Str] = []
+    for arg in g.args
+        if find_arg(f.args, arg.name) == None and is_required_arg(arg)
+            out = list.push(out, cat_sdl(["the argument `", type_name, ".", f.name, "(", arg.name,
+                                          ":)` was added and has no default"]))
+    for arg in f.args
+        if let Some(n) = find_arg(g.args, arg.name)
+            if not is_required_arg(arg) and is_required_arg(n)
+                out = list.push(out, cat_sdl(["the argument `", type_name, ".", f.name, "(", arg.name,
+                                              ":)` became required"]))
+    out
+
+// A non-null argument with no default is required: a client that
+// omitted it may no longer.
+fn is_required_arg(a: GqlArgDef) -> Bool
+    gqllang.is_non_null(a.type_ref) and a.default_value == None
+
+fn same_type(a: gqllang.GqlTypeRef, b: gqllang.GqlTypeRef) -> Bool
+    gqllang.print_type(a) == gqllang.print_type(b)
+
+fn narrowed(a: gqllang.GqlTypeRef, b: gqllang.GqlTypeRef) -> Bool
+    if a.name != b.name
+        return true
+    if a.list_depth != b.list_depth
+        return true
+    for k in 0..list.len(b.non_null)
+        if not list.get(a.non_null, k, false) and list.get(b.non_null, k, false)
+            return true
+    false

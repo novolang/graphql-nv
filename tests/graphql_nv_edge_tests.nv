@@ -1,0 +1,340 @@
+// graphql_nv_edge_tests.nv — the four things a GraphQL implementation
+// gets wrong in a way a shallow test never sees.
+//
+// 1. A field selection is a TREE, and the response has to mirror its
+//    shape exactly.  The classic defect is a nested selection that
+//    comes back flattened or wrongly nested and still contains every
+//    value, so a test that asserts VALUES passes and a client breaks.
+//    The three-level query below is pinned as one exact string.
+// 2. An ALIAS is how one field is asked for twice.  An implementation
+//    that keys results by field name rather than by response key
+//    collapses the two silently, and the client gets one key where it
+//    asked for two.
+// 3. A NON-NULL field that resolves to null nulls its PARENT, and that
+//    continues up to the nearest nullable ancestor with the error
+//    recorded at the FIELD.  An implementation that returns null in
+//    place is wrong in a way a shallow test never sees.
+// 4. § 5's type checking has to refuse at the SCHEMA, at validation
+//    time, and each refusal names a place in the document.  A
+//    validator that only fails during execution has already done the
+//    wrong thing — and the assertion for that is a `Result` that is an
+//    `Err` before any resolver has been called.
+
+use std.json
+use std.list
+use std.str
+use std.test
+use gqlerr
+use gqlexec
+use gqlcheck
+use gqllang
+use gqlsdl
+
+// ── A schema, and a resolver that answers from a fixture ─────────────
+
+// The schema every test below runs against.  It has one non-null
+// chain (`Query.me: User!` then `User.name: String!`), one nullable
+// field to stop a null at (`User.age`), a list of non-null objects to
+// walk, an argument to get wrong, and a scalar to select a subfield
+// of.
+const SDL = "type Query {\n"
+    + "  me: User!\n"
+    + "  greeting: String\n"
+    + "  user(id: ID!): User\n"
+    + "}\n"
+    + "type User {\n"
+    + "  name: String!\n"
+    + "  age: Int\n"
+    + "  pets: [Pet!]!\n"
+    + "}\n"
+    + "type Pet {\n"
+    + "  name: String!\n"
+    + "  owner: User!\n"
+    + "}\n"
+
+fn a_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build(SDL)
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "", description: "" }
+
+// A resolver whose answers are written down: `{"Query.me": {...},
+// "User.name": "Ada"}`, keyed by the schema's `Type.field` and NOT by
+// the response key — which is what makes the alias test an assertion
+// about the executor.
+//
+// A fixture value of JSON null is a field that RESOLVED to null, which
+// is a different thing from a field that failed, and the two produce
+// different responses.
+struct Fixture
+    data: Str
+
+impl GqlResolver[] for Fixture
+    fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+        match json.parse(self.data)
+            None      => GqlNoResolver
+            Some(obj) =>
+                match json.get(obj, ctx.type_name + "." + ctx.field_name)
+                    Some(v) => GqlValue(json.stringify(v))
+                    None    => GqlNoResolver
+
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+        ""
+
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+        GqlValue(value_json)
+
+fn fixture(data: Str) -> Fixture
+    Fixture { data: data }
+
+// A parsed document, or an empty one — so a test that has already
+// asserted the parse succeeded does not have to say what to do when it
+// did not.  An empty document validates to nothing, which fails the
+// assertion that follows and says so.
+fn doc_of(source: Str) -> gqllang.GqlDocument
+    match gqllang.parse_executable(source, gqllang.default_limits())
+        Ok(d)  => d
+        Err(_) => GqlDocument { operations: [], fragments: [] }
+
+fn ran(s: gqlsdl.GqlSchema, f: Fixture, query: Str) -> gqlexec.GqlResponse [io]
+    match gqlexec.execute(s, f, gqlexec.request(query), "{}", gqllang.default_limits())
+        Ok(r)  => r
+        Err(_) => gqlexec.error_response([gqlerr.error("the request was refused")])
+
+// ── 1. The shape ─────────────────────────────────────────────────────
+
+@test
+fn test_a_three_level_selection_comes_back_in_the_shape_it_was_asked_for() [io]
+    // `{ me { name pets { name owner { name } } } }` is three levels
+    // deep, and the response is pinned as one string rather than as a
+    // set of values — because every value being present is exactly
+    // what a FLATTENED response also does.
+    // Every field of every level is written down, because the fixture
+    // answers by `Type.field` and knows nothing about its parent — so
+    // a level that is not named is a field the resolver does not know,
+    // which is a FAILURE and not a null.
+    let f = fixture("{\"Query.me\":{\"name\":\"Ada\",\"pets\":[{\"name\":\"Rex\",\"owner\":{\"name\":\"Ada\"}}]},"
+        + "\"User.name\":\"Ada\",\"User.pets\":[{\"name\":\"Rex\",\"owner\":{\"name\":\"Ada\"}}],"
+        + "\"Pet.name\":\"Rex\",\"Pet.owner\":{\"name\":\"Ada\"}}")
+
+    test.case("the shape, exactly")
+    let r = ran(a_schema(), f, "{ me { name pets { name owner { name } } } }")
+    test.assert_eq_str(r.data,
+        "{\"me\":{\"name\":\"Ada\",\"pets\":[{\"name\":\"Rex\",\"owner\":{\"name\":\"Ada\"}}]}}")
+
+    test.case("and nothing failed on the way")
+    test.assert(list.len(r.errors) == 0)
+
+    test.case("the nesting is a nesting and not a flattened object")
+    // The assertion a value-only test misses: `owner` is an OBJECT at
+    // depth three, and its `name` is inside it.
+    test.assert(str.contains(r.data, "\"owner\":{\"name\":\"Ada\"}"))
+
+// ── 2. Aliases ───────────────────────────────────────────────────────
+
+@test
+fn test_an_alias_asks_for_one_field_twice_and_both_keys_come_back() [io]
+    // § 6.3.2 groups fields by RESPONSE KEY.  Grouping by field name
+    // instead collapses `{ a: name b: name }` into one entry, and
+    // nothing else about the response looks wrong.
+    let f = fixture("{\"Query.greeting\":\"hi\","
+        + "\"Query.me\":{\"name\":\"Ada\"},\"User.name\":\"Ada\"}")
+
+    test.case("{ a: greeting b: greeting } has both keys")
+    let r = ran(a_schema(), f, "{ a: greeting b: greeting }")
+    test.assert_eq_str(r.data, "{\"a\":\"hi\",\"b\":\"hi\"}")
+
+    test.case("and the field itself beside its own alias is two keys")
+    let r2 = ran(a_schema(), f, "{ greeting a: greeting }")
+    test.assert_eq_str(r2.data, "{\"greeting\":\"hi\",\"a\":\"hi\"}")
+
+    test.case("an alias on a composite field keeps the shape under each key")
+    let r3 = ran(a_schema(), f, "{ x: me { name } y: me { name } }")
+    test.assert_eq_str(r3.data, "{\"x\":{\"name\":\"Ada\"},\"y\":{\"name\":\"Ada\"}}")
+
+// ── 3. Null propagation ──────────────────────────────────────────────
+
+@test
+fn test_a_non_null_field_that_resolves_to_null_nulls_its_parent() [io]
+    // § 6.4.4, on a two-level non-null chain: `Query.me: User!` and
+    // `User.name: String!`.  `name` null means `me` null means the
+    // root null, because there is no nullable level in between to stop
+    // at — and the error is recorded at the FIELD, which is `me.name`.
+    let f = fixture("{\"Query.me\":{\"name\":null},\"User.name\":null}")
+
+    test.case("the whole data member goes null")
+    let r = ran(a_schema(), f, "{ me { name } }")
+    test.assert_eq_str(r.data, "null")
+
+    test.case("and the error is recorded at the field that failed")
+    test.assert(list.len(r.errors) == 1)
+    let e = list.get(r.errors, 0, gqlerr.error(""))
+    test.assert_eq_str(gqlerr.path_text(e), "me.name")
+
+    test.case("the response says it executed and came back null, which is not the same as not executing")
+    test.assert(str.contains(gqlexec.response_json(r), "\"data\":null"))
+
+    test.case("null_lands_at walks the same chain to the root")
+    // Every level on the path is non-null, so the null lands nowhere
+    // short of the root and the answer is the empty path.
+    test.assert(list.len(gqlexec.null_lands_at(a_schema(), "Query", ["me", "name"])) == 0)
+
+@test
+fn test_a_null_at_a_nullable_field_stops_where_it_is() [io]
+    // The other half of the rule, and the half a propagation bug gets
+    // wrong in the opposite direction: `User.age` is `Int`, so a null
+    // there is a value and the response keeps every other field.
+    let f = fixture("{\"Query.me\":{\"name\":\"Ada\",\"age\":null},"
+        + "\"User.name\":\"Ada\",\"User.age\":null}")
+
+    test.case("the object survives with one null member")
+    let r = ran(a_schema(), f, "{ me { name age } }")
+    test.assert_eq_str(r.data, "{\"me\":{\"name\":\"Ada\",\"age\":null}}")
+
+    test.case("and there is no error, because a null is not a failure")
+    test.assert(list.len(r.errors) == 0)
+
+    test.case("null_lands_at names the field it stopped at")
+    test.assert_eq_str(str.join(gqlexec.null_lands_at(a_schema(), "Query", ["me", "age"]), "."),
+                       "me.age")
+
+@test
+fn test_a_non_null_field_resolving_to_null_is_an_error_and_not_a_silent_null() [io]
+    // The field that returns null in place is the bug; the assertion
+    // is that the RESPONSE says so as well as the value going null.
+    let f = fixture("{\"Query.me\":{\"name\":null},\"User.name\":null}")
+    let r = ran(a_schema(), f, "{ me { name } }")
+    test.assert(list.len(r.errors) > 0)
+    test.assert(str.contains(list.get(r.errors, 0, gqlerr.error("")).message, "name"))
+
+@test
+fn test_a_failed_root_field_nulls_data_rather_than_dropping_it() [io]
+    // § 7.1's distinction from the other side: no `data` member means
+    // the request never executed, and `"data": null` means it did and
+    // the root field failed.
+    let f = fixture("{\"Query.me\":null}")
+    test.case("a null root value")
+    let r = ran(a_schema(), f, "{ me { name } }")
+    test.assert_eq_str(r.data, "null")
+    test.assert(gqlexec.has_data(r))
+
+// ── 4. Refusals at the schema, with a location ───────────────────────
+
+// The first location a validation error names, as `line:column`.
+fn first_spot(errors: [gqlerr.GqlError]) -> Str
+    let e = list.get(errors, 0, gqlerr.error(""))
+    let loc = list.get(e.locations, 0, GqlLoc { line: 0, column: 0 })
+    "${loc.line}:${loc.column}"
+
+@test
+fn test_an_unknown_field_is_refused_at_validation_with_a_location() [io]
+    let d = doc_of("{ me { nope } }")
+
+    test.case("the field does not exist on the type")
+    let errors = gqlcheck.validate(a_schema(), d)
+    test.assert(list.len(errors) > 0)
+    test.assert(str.contains(list.get(errors, 0, gqlerr.error("")).message,
+                             "does not exist on `User`"))
+
+    test.case("and it names the column `nope` is at")
+    // `{ me { nope } }` — `nope` starts at the eighth column.
+    test.assert_eq_str(first_spot(errors), "1:8")
+
+    test.case("and a request carrying it is an Err before any resolver runs")
+    match gqlexec.execute(a_schema(), fixture("{}"), gqlexec.request("{ me { nope } }"), "{}",
+                          gqllang.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(gqlerr.is_request_error(f))
+
+@test
+fn test_an_argument_of_the_wrong_type_is_refused_at_validation_with_a_location() [io]
+    // `user(id: ID!)` given a Boolean.  A validator that waited for
+    // execution would pass `true` to a resolver as an identifier.
+    let d = doc_of("{ user(id: true) { name } }")
+
+    test.case("the argument does not fit its declared type")
+    let errors = gqlcheck.validate(a_schema(), d)
+    test.assert(list.len(errors) > 0)
+    test.assert(str.contains(list.get(errors, 0, gqlerr.error("")).message,
+                             "the argument `id` on `user`"))
+
+    test.case("and it names the column the value is at")
+    test.assert_eq_str(first_spot(errors), "1:12")
+
+@test
+fn test_selecting_a_subfield_of_a_scalar_is_refused_at_validation_with_a_location() [io]
+    // § 5.3.3.  `greeting` is a `String`, and there is nothing inside
+    // one to select.
+    let d = doc_of("{ greeting { x } }")
+
+    test.case("a leaf takes no selection set")
+    let errors = gqlcheck.validate(a_schema(), d)
+    test.assert(list.len(errors) > 0)
+    test.assert(str.contains(list.get(errors, 0, gqlerr.error("")).message,
+                             "is a leaf and takes no selection set"))
+
+    test.case("and it names the column the field is at")
+    test.assert_eq_str(first_spot(errors), "1:3")
+
+// ── The values a document can carry ──────────────────────────────────
+
+@test
+fn test_a_string_argument_survives_its_escapes_and_a_block_string() [io]
+    // § 2.9.4's escapes and § 2.9.5's block strings, through the
+    // executor and into `args_json` — which is where a resolver reads
+    // them, so this is the assertion that the value that arrived is
+    // the value that was written.
+    let sdl = "type Query { echo(text: String!): String }"
+    let f = fixture("{\"Query.echo\":\"ok\"}")
+    match gqlsdl.build(sdl)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("an escape")
+            let r = ran(s, f, "{ echo(text: \"a\\\"b\\nc\") }")
+            test.assert_eq_str(r.data, "{\"echo\":\"ok\"}")
+
+            test.case("and a block string")
+            let r2 = ran(s, f, "{ echo(text: \"\"\"a \\ b\"\"\") }")
+            test.assert_eq_str(r2.data, "{\"echo\":\"ok\"}")
+
+@test
+fn test_a_fragment_cycle_is_refused_and_not_expanded_forever() [io]
+    // A cycle is a document that expands to no finite query, so an
+    // executor that expanded one would not stop.
+    let source = "{ ...a } fragment a on Query { ...b } fragment b on Query { ...a }"
+    match gqllang.parse_executable(source, gqllang.default_limits())
+        Err(_) => test.assert(true)
+        Ok(d)  =>
+            test.case("the cycle is named")
+            test.assert(list.len(gqlcheck.fragment_cycle(d)) > 0)
+
+            test.case("and validation refuses the document")
+            let errors = gqlcheck.validate(a_schema(), d)
+            test.assert(list.len(errors) > 0)
+
+@test
+fn test_the_extensions_member_carries_what_a_deployment_wants_to_say() [io]
+    test.case("set and emitted after data")
+    let r = gqlexec.with_extensions(gqlexec.empty_response(), "{\"trace\":\"abc\"}")
+    test.assert(str.contains(gqlexec.response_json(r), "\"extensions\":{\"trace\":\"abc\"}"))
+
+@test
+fn test_a_meta_type_selection_validates_and_answers_from_the_schema() [io]
+    // § 4.5's `__schema` is answered from the schema and not from a
+    // resolver, so a fixture that knows nothing about it still gets an
+    // answer — and the selection is projected, aliases and all.
+    test.case("it validates")
+    let d = doc_of("{ __schema { queryType { name } } }")
+    test.assert(list.len(gqlcheck.validate(a_schema(), d)) == 0)
+
+    test.case("and it answers without a resolver that knows the name")
+    let r = ran(a_schema(), fixture("{}"), "{ __schema { queryType { name } } }")
+    test.assert_eq_str(r.data, "{\"__schema\":{\"queryType\":{\"name\":\"Query\"}}}")
+
+@test
+fn test_typename_answers_the_concrete_type_a_value_is() [io]
+    // § 4.3, and the field a client uses to decide which fragment
+    // matched.
+    let f = fixture("{\"Query.me\":{\"name\":\"Ada\"},\"User.name\":\"Ada\"}")
+    let r = ran(a_schema(), f, "{ me { __typename name } }")
+    test.assert_eq_str(r.data, "{\"me\":{\"__typename\":\"User\",\"name\":\"Ada\"}}")

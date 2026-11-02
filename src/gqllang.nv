@@ -1,8 +1,6 @@
 // gqllang.nv — the query language: a lexer and a document parser, both
 // `[]`.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // OCTOBER 2021 IS THE TARGET, and the three things it adds over June
 // 2018 that an implementation notices are named here so a reader of a
 // June 2018 book knows what changed:
@@ -40,6 +38,8 @@
 // checked as the parse descends, so a document past a bound is refused
 // at the byte it crossed it rather than after it has been built.
 
+use std.list
+use std.str
 use gqlerr
 
 // What kind of operation a definition is (§ 2.3).
@@ -193,6 +193,850 @@ pub struct GqlLimits
     // them.
     max_spreads: Int
 
+// ── The lexer ────────────────────────────────────────────────────────
+
+// One token: what it is, what it says, and where it starts.
+//
+// `kind` is one of `name`, `int`, `float`, `string`, `punct`, `eof`.
+struct Tok
+    kind: Str
+    text: Str
+    line: Int
+    col: Int
+
+// The lexer's whole state: the source's characters, and how far it has
+// read.  The cursor fields are `var` because the scan writes them.
+//
+// The source is held as CHARACTERS rather than bytes, because a column
+// is one-based and counted in characters, and a scanner that counted
+// its position in bytes reports the wrong column for every document
+// that is not ASCII.
+struct Lex
+    cs: [Str]
+    var i: Int
+    var line: Int
+    var col: Int
+    var fault: ?gqlerr.GqlFault
+
+// The character at an index, or the empty string past the end.
+fn ch_at(l: Lex, k: Int) -> Str
+    list.get(l.cs, k, "")
+
+// The character under the cursor, or the empty string at the end.
+fn ch_here(l: Lex) -> Str
+    ch_at(l, l.i)
+
+// Whether the scan has read the whole source.
+fn lex_done(l: Lex) -> Bool
+    l.i >= list.len(l.cs)
+
+// Record the first fault, and only the first: one mistake is one
+// message.
+fn lex_fail(var l: Lex, msg: Str)
+    if l.fault == None
+        l.fault = Some(GqlSyntaxError(msg, l.line, l.col))
+
+// One character on, keeping the line and the character column.
+fn advance(var l: Lex)
+    let c = ch_here(l)
+    l.i = l.i + 1
+    if c == "\n"
+        l.line = l.line + 1
+        l.col = 1
+    else
+        l.col = l.col + 1
+
+fn is_digit_char(c: Str) -> Bool
+    if str.len(c) != 1
+        return false
+    let b = str.byte_at(c, 0) ?? 0
+    b >= 48 and b <= 57
+
+fn is_name_start(c: Str) -> Bool
+    if str.len(c) != 1
+        return false
+    let b = str.byte_at(c, 0) ?? 0
+    b >= 65 and b <= 90 or b >= 97 and b <= 122 or b == 95
+
+fn is_name_char(c: Str) -> Bool
+    is_name_start(c) or is_digit_char(c)
+
+// Whitespace, and the commas and byte-order marks § 2.1 ignores, and a
+// `#` comment, which runs to the end of the line.
+fn skip_ignored(var l: Lex)
+    var done = false
+    while not done
+        let c = ch_here(l)
+        if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "," or c == "\u{feff}"
+            advance(l)
+        elif c == "#"
+            while ch_here(l) != "" and ch_here(l) != "\n"
+                advance(l)
+        else
+            done = true
+
+// One token, consuming it.
+//
+// A character that can start nothing is a fault rather than a token:
+// the parser has no "unknown character" case, so a lexer that passed
+// one through would report it as a grammar error at the wrong place.
+fn lex_one(var l: Lex) -> Tok
+    let line = l.line
+    let col = l.col
+    let c = ch_here(l)
+    if c == "\""
+        lex_string(var l, line, col)
+    elif is_name_start(c)
+        lex_name(var l, line, col)
+    elif is_digit_char(c) or c == "-" and is_digit_char(ch_at(l, l.i + 1))
+        lex_number(var l, line, col)
+    else
+        lex_punct(var l, line, col)
+
+// A name, consuming it.
+fn lex_name(var l: Lex, line: Int, col: Int) -> Tok
+    var parts: [Str] = []
+    while is_name_char(ch_here(l))
+        parts = list.push(parts, ch_here(l))
+        advance(l)
+    Tok { kind: "name", text: str.join(parts, ""), line: line, col: col }
+
+// A number, consuming it: an `Int` unless it has a fraction or an
+// exponent, which make it a `Float` (§ 2.9.1).
+fn lex_number(var l: Lex, line: Int, col: Int) -> Tok
+    var parts: [Str] = []
+    var is_float = false
+    if ch_here(l) == "-"
+        parts = list.push(parts, "-")
+        advance(l)
+    if ch_here(l) == "0" and is_digit_char(ch_at(l, l.i + 1))
+        lex_fail(var l, "a number may not be written with a leading zero")
+    while is_digit_char(ch_here(l))
+        parts = list.push(parts, ch_here(l))
+        advance(l)
+    if ch_here(l) == "." and is_digit_char(ch_at(l, l.i + 1))
+        is_float = true
+        parts = list.push(parts, ".")
+        advance(l)
+        while is_digit_char(ch_here(l))
+            parts = list.push(parts, ch_here(l))
+            advance(l)
+    let e = ch_here(l)
+    if e == "e" or e == "E"
+        if is_digit_char(ch_at(l, l.i + 1))
+            is_float = true
+            parts = list.push(parts, e)
+            advance(l)
+            while is_digit_char(ch_here(l))
+                parts = list.push(parts, ch_here(l))
+                advance(l)
+        elif (ch_at(l, l.i + 1) == "+" or ch_at(l, l.i + 1) == "-") and is_digit_char(ch_at(l, l.i + 2))
+            is_float = true
+            parts = list.push(parts, e)
+            parts = list.push(parts, ch_at(l, l.i + 1))
+            advance(l)
+            advance(l)
+            while is_digit_char(ch_here(l))
+                parts = list.push(parts, ch_here(l))
+                advance(l)
+    if is_name_start(ch_here(l)) or ch_here(l) == "."
+        lex_fail(var l, "a number may not be followed by a name or a dot")
+    if is_float
+        Tok { kind: "float", text: str.join(parts, ""), line: line, col: col }
+    else
+        Tok { kind: "int", text: str.join(parts, ""), line: line, col: col }
+
+// A punctuator, consuming it.
+fn lex_punct(var l: Lex, line: Int, col: Int) -> Tok
+    let c = ch_here(l)
+    if c == "." and ch_at(l, l.i + 1) == "." and ch_at(l, l.i + 2) == "."
+        advance(l)
+        advance(l)
+        advance(l)
+        return Tok { kind: "punct", text: "...", line: line, col: col }
+    if str.contains("!$&():=@[]{|}", c)
+        advance(l)
+        return Tok { kind: "punct", text: c, line: line, col: col }
+    lex_fail(var l, "a character that cannot start a token")
+    Tok { kind: "punct", text: "", line: line, col: col }
+
+// A string, consuming it: `"…"` or the block form `"""…"""`.
+fn lex_string(var l: Lex, line: Int, col: Int) -> Tok
+    if ch_at(l, l.i + 1) == "\"" and ch_at(l, l.i + 2) == "\""
+        return lex_block_string(var l, line, col)
+    lex_plain_string(var l, line, col)
+
+// A single-quoted-line string.  Escapes are decoded here, so the
+// token's text is the value the client meant rather than the source
+// that spells it.
+fn lex_plain_string(var l: Lex, line: Int, col: Int) -> Tok
+    advance(l)
+    var parts: [Str] = []
+    var closed = false
+    while not closed and l.fault == None
+        let c = ch_here(l)
+        match c
+            ""             => lex_fail(var l, "a string that runs to the end of the document")
+            _ if c == "\"" =>
+                advance(l)
+                closed = true
+            "\n"           => lex_fail(var l, "a line break inside a string")
+            "\\"           =>
+                advance(l)
+                parts = list.push(parts, lex_escape(var l))
+            _              =>
+                parts = list.push(parts, c)
+                advance(l)
+    Tok { kind: "string", text: str.join(parts, ""), line: line, col: col }
+
+// One escape's value, the backslash already consumed.
+fn lex_escape(var l: Lex) -> Str
+    let c = ch_here(l)
+    advance(l)
+    match c
+        "\"" | "\\" | "/" => c
+        "b"               => "\u{8}"
+        "f"               => "\u{c}"
+        "n"               => "\n"
+        "r"               => "\r"
+        "t"               => "\t"
+        "u"               => lex_unicode_escape(var l)
+        _                 =>
+            lex_fail(var l, "an escape that GraphQL does not define")
+            ""
+
+// `\uXXXX`, and the pair of escapes a character outside the basic plane
+// is written with.
+fn lex_unicode_escape(var l: Lex) -> Str
+    let Some(cp) = lex_hex4(var l) else return ""
+    if cp >= 55296 and cp <= 56319
+        if ch_here(l) == "\\" and ch_at(l, l.i + 1) == "u"
+            advance(l)
+            advance(l)
+            match lex_hex4(var l)
+                Some(low) if low >= 56320 and low <= 57343 =>
+                    return str.from_char(65536 + (cp - 55296) * 1024 + (low - 56320))
+                _                                          => ()
+        // A leading surrogate with no trailing half, and a trailing
+        // half on its own, are both code points UTF-8 cannot carry:
+        // `str.from_char` answers the replacement character.
+        return str.from_char(cp)
+    str.from_char(cp)
+
+// Four hex digits, or `None` after recording a fault.
+fn lex_hex4(var l: Lex) -> ?Int
+    var n = 0
+    for _ in 0..4
+        match hex_value(ch_here(l))
+            Some(d) =>
+                n = n * 16 + d
+                advance(l)
+            None    =>
+                lex_fail(var l, "a `\\u` escape needs four hex digits")
+                return None
+    Some(n)
+
+fn hex_value(c: Str) -> ?Int
+    let b = str.byte_at(c, 0) ?? 0 - 1
+    match b
+        48..=57  => Some(b - '0')
+        65..=70  => Some(b - 'A' + 10)
+        97..=102 => Some(b - 'a' + 10)
+        _        => None
+
+// A block string, `"""…"""`: raw, so no escape is processed inside one
+// and a lone backslash is a backslash.
+fn lex_block_string(var l: Lex, line: Int, col: Int) -> Tok
+    // A ladder, not a `match`: a match arm guard that builds a `Str` leaks
+    // that temporary under the leak check of `novo test`.
+    advance(l)
+    advance(l)
+    advance(l)
+    var parts: [Str] = []
+    var closed = false
+    while not closed and l.fault == None
+        let c = ch_here(l)
+        if c == ""
+            lex_fail(var l, "a block string that runs to the end of the document")
+        elif c == "\\" and ch_at(l, l.i + 1) == "\"" and ch_at(l, l.i + 2) == "\"" and ch_at(l, l.i + 3) == "\""
+            parts = list.push(parts, "\"\"\"")
+            advance(l)
+            advance(l)
+            advance(l)
+            advance(l)
+        elif c == "\"" and ch_at(l, l.i + 1) == "\"" and ch_at(l, l.i + 2) == "\""
+            advance(l)
+            advance(l)
+            advance(l)
+            closed = true
+        else
+            parts = list.push(parts, c)
+            advance(l)
+    Tok { kind: "string", text: block_value(str.join(parts, "")), line: line, col: col }
+
+// § 2.9.4's block string value: the common indentation comes off, and
+// the blank lines the delimiters sit on do not survive.
+fn block_value(raw: Str) -> Str
+    let lines = str.split(raw, "\n")
+    var start = 0
+    var stop = list.len(lines)
+    if start < stop and is_blank_line(list.get(lines, start, ""))
+        start = start + 1
+    while stop > start and is_blank_line(list.get(lines, stop - 1, ""))
+        stop = stop - 1
+    let indent = common_indent(lines, start, stop)
+    var out: [Str] = []
+    var k = start
+    while k < stop
+        out = list.push(out, strip_indent(list.get(lines, k, ""), indent))
+        k = k + 1
+    str.join(out, "\n")
+
+fn is_blank_line(s: Str) -> Bool
+    str.len(str.trim(s)) == 0
+
+// The smallest leading indentation of the lines that have any content.
+fn common_indent(lines: [Str], start: Int, stop: Int) -> Int
+    var best = -1
+    var k = start
+    while k < stop
+        let ln = list.get(lines, k, "")
+        if not is_blank_line(ln)
+            let n = leading_ws(ln)
+            if best < 0 or n < best
+                best = n
+        k = k + 1
+    if best < 0
+        return 0
+    best
+
+fn leading_ws(s: Str) -> Int
+    var k = 0
+    while k < str.len(s)
+        let c = byte_str(s, k)
+        if c != " " and c != "\t"
+            return k
+        k = k + 1
+    // cov: skip — `leading_ws` is called only for a line `is_blank_line` answered non-blank, so the scan meets a non-space character before the line ends
+    k
+
+fn strip_indent(s: Str, n: Int) -> Str
+    var k = 0
+    while k < n and k < str.len(s) and (byte_str(s, k) == " " or byte_str(s, k) == "\t")
+        k = k + 1
+    str.slice(s, k, str.len(s))
+
+// One byte of a string as a one-byte `Str`, or the empty string past
+// the end.
+fn byte_str(s: Str, k: Int) -> Str
+    str.byte_str_at(s, k) ?? ""
+
+// The whole source as tokens, the last of them `eof`.
+fn lex(source: Str) -> Result<[Tok], gqlerr.GqlFault> []
+    var l = Lex { cs: str.chars(source), i: 0, line: 1, col: 1, fault: None }
+    var out: [Tok] = []
+    while not lex_done(l) and l.fault == None
+        skip_ignored(var l)
+        if not lex_done(l) and l.fault == None
+            out = list.push(out, lex_one(var l))
+    if l.fault != None
+        return Err(l.fault ?? GqlSyntaxError("the document did not lex", 1, 1))
+    out = list.push(out, Tok { kind: "eof", text: "", line: l.line, col: l.col })
+    Ok(out)
+
+// ── The parser's state ───────────────────────────────────────────────
+
+// The parser's whole state: the tokens, how far it has read, the
+// bounds it is enforcing, and the measurements it is taking as it
+// goes.  Every field but `toks` and `lim` is `var` because the descent
+// writes it.
+struct Cur
+    toks: [Tok]
+    var i: Int
+    lim: GqlLimits
+    var fault: ?gqlerr.GqlFault
+    var depth: Int
+    var aliases: Int
+    var spreads: Int
+
+// A token that is not there.  The parser keeps going after a fault so
+// that one mistake is one message, and this is what it reads when it
+// has run past the end.
+fn eof_tok() -> Tok
+    // cov: skip — no scan of this parser moves the cursor past the end: every `bump` follows a token whose kind or punctuation was already matched
+    Tok { kind: "eof", text: "", line: 0, col: 0 }
+
+fn tok(c: Cur) -> Tok
+    if c.i < 0 or c.i >= list.len(c.toks)
+        // cov: skip — the out-of-range cursor `eof_tok` exists for, reachable only from a caller that moves `c.i` itself
+        return eof_tok()
+    list.get(c.toks, c.i)
+
+fn kind(c: Cur) -> Str
+    let t = tok(c)
+    t.kind
+
+fn say(c: Cur) -> Str
+    let t = tok(c)
+    t.text
+
+fn line_at(c: Cur) -> Int
+    let t = tok(c)
+    t.line
+
+fn col_at(c: Cur) -> Int
+    let t = tok(c)
+    t.col
+
+fn at_end(c: Cur) -> Bool
+    kind(c) == "eof"
+
+fn failed(c: Cur) -> Bool
+    c.fault != None
+
+// The first fault, for a caller that has already checked `failed`.
+fn the_fault(c: Cur) -> gqlerr.GqlFault
+    c.fault ?? GqlSyntaxError("the document did not parse", 1, 1)
+
+// Record the first fault, and only the first.
+fn pfail(var c: Cur, msg: Str)
+    if c.fault == None
+        c.fault = Some(GqlSyntaxError(msg, line_at(c), col_at(c)))
+
+// Refuse a document that crossed a bound, naming the measurement rather
+// than the rule.
+fn limit_fail(var c: Cur, measure: Str, value: Int, ceiling: Int)
+    if c.fault == None
+        c.fault = Some(GqlTooLarge(measure, value, ceiling))
+
+// One token, consumed.
+fn bump(var c: Cur) -> Tok
+    let t = tok(c)
+    c.i = c.i + 1
+    t
+
+// Whether the cursor is on a punctuator, without consuming it.
+fn on_punct(c: Cur, t: Str) -> Bool
+    kind(c) == "punct" and say(c) == t
+
+// Consume a punctuator when it is the one wanted.
+fn eat(var c: Cur, k: Str, t: Str) -> Bool
+    if failed(c)
+        return false
+    if kind(c) != k or say(c) != t
+        return false
+    c.i = c.i + 1
+    true
+
+// Consume a punctuator, or record that one was expected.
+fn want(var c: Cur, k: Str, t: Str)
+    if not eat(var c, k, t)
+        pfail(var c, "expected `" + t + "`")
+
+// A name token's text, consumed.
+fn want_name(var c: Cur, what: Str) -> Str
+    if failed(c)
+        return ""
+    if kind(c) != "name"
+        pfail(var c, "expected " + what)
+        return ""
+    let t = bump(var c)
+    t.text
+
+// Whether anything can start a selection.  What tells "an empty set",
+// which is a fault, from "the set ended".
+fn can_select(c: Cur) -> Bool
+    kind(c) == "name" or on_punct(c, "...")
+
+// A value node, from its parts.
+fn value_node(k: Str, text: Str, items: [GqlValueNode], names: [Str], at: Tok) -> GqlValueNode
+    GqlValueNode { kind: k, text: text, items: items, names: names,
+                   loc: GqlLoc { line: at.line, column: at.col } }
+
+// A location, for a node that is not a value.
+fn loc_of(t: Tok) -> gqlerr.GqlLoc
+    GqlLoc { line: t.line, column: t.col }
+
+// A bare selection, from its parts.
+fn selection_of(k: Str, name: Str, alias_text: Str, args: [GqlArgNode], dirs: [GqlDirectiveNode],
+                cond: Str, sels: [GqlSelection], at: Tok) -> GqlSelection
+    GqlSelection { kind: k, name: name, alias_name: alias_text, args: args,
+                   directives: dirs, type_condition: cond, selections: sels,
+                   loc: loc_of(at) }
+
+fn op_kind_of(word: Str) -> GqlOpKind
+    if word == "mutation"
+        return GqlMutation
+    if word == "subscription"
+        return GqlSubscription
+    GqlQuery
+
+// ── The descent ──────────────────────────────────────────────────────
+
+// Definitions until the end of the document.
+fn parse_document(var c: Cur) -> GqlDocument
+    var ops: [GqlOperation] = []
+    var frags: [GqlFragment] = []
+    while not failed(c) and not at_end(c)
+        parse_definition(var c, var ops, var frags)
+    GqlDocument { operations: ops, fragments: frags }
+
+// One definition, appended to whichever of the two lists it belongs in.
+//
+// A type-system definition is refused BY NAME here: this entry point
+// parses EXECUTABLE documents, and a client that sends
+// `type User { … }` has asked to change the schema rather than to read
+// it.
+fn parse_definition(var c: Cur, var ops: [GqlOperation], var frags: [GqlFragment])
+    if on_punct(c, "{")
+        let start = tok(c)
+        let sels = parse_selection_set(var c)
+        ops = list.push(ops, GqlOperation { kind: GqlQuery, name: "", variables: [],
+                                            directives: [], selections: sels,
+                                            loc: loc_of(start) })
+        return
+    if kind(c) != "name"
+        pfail(var c, "expected an operation or a fragment definition")
+        return
+    let word = say(c)
+    if is_type_system_word(word)
+        pfail(var c,
+            "`" + word + "` is a type-system definition, and this entry point parses executable documents")
+        return
+    if word == "fragment"
+        frags = list.push(frags, parse_fragment(var c))
+        return
+    if word == "query" or word == "mutation" or word == "subscription"
+        ops = list.push(ops, parse_operation(var c))
+        return
+    pfail(var c, "expected an operation or a fragment definition")
+
+// The words § 3 reserves for the schema.  Spelled out so that the
+// refusal names the word it refused.
+fn is_type_system_word(word: Str) -> Bool
+    word == "type" or word == "schema" or word == "directive" or word == "extend"
+        or word == "interface" or word == "union" or word == "enum" or word == "input"
+        or word == "scalar"
+
+// One operation, keyword and all.
+fn parse_operation(var c: Cur) -> GqlOperation
+    let start = bump(var c)
+    let k = op_kind_of(start.text)
+    var name = ""
+    if kind(c) == "name"
+        let nt = bump(var c)
+        name = nt.text
+    let vars = parse_var_defs(var c)
+    let dirs = parse_directives(var c)
+    var sels: [GqlSelection] = []
+    if not on_punct(c, "{")
+        pfail(var c, "an operation needs a selection set")
+    else
+        sels = parse_selection_set(var c)
+    GqlOperation { kind: k, name: name, variables: vars, directives: dirs,
+                   selections: sels, loc: loc_of(start) }
+
+// `($x: Int = 3 @dir)`.
+fn parse_var_defs(var c: Cur) -> [GqlVarDef]
+    var out: [GqlVarDef] = []
+    if not eat(var c, "punct", "(")
+        return out
+    while not failed(c) and not on_punct(c, ")")
+        if at_end(c)
+            pfail(var c, "unterminated variable definitions")
+        elif not eat(var c, "punct", "$")
+            pfail(var c, "expected `$` before a variable name")
+        else
+            let start = tok(c)
+            let nm = want_name(var c, "a variable name")
+            want(var c, "punct", ":")
+            let tr = parse_type_node(var c)
+            var def: ?GqlValueNode = None
+            if eat(var c, "punct", "=")
+                def = Some(parse_value_node(var c))
+            let dirs = parse_directives(var c)
+            out = list.push(out, GqlVarDef { name: nm, type_ref: tr, default_value: def,
+                                             directives: dirs, loc: loc_of(start) })
+    want(var c, "punct", ")")
+    out
+
+// `@name(args)`, repeated.
+fn parse_directives(var c: Cur) -> [GqlDirectiveNode]
+    var out: [GqlDirectiveNode] = []
+    while not failed(c) and on_punct(c, "@")
+        let start = bump(var c)
+        let nm = want_name(var c, "a directive name")
+        let args = parse_arguments(var c)
+        out = list.push(out, GqlDirectiveNode { name: nm, args: args, loc: loc_of(start) })
+    out
+
+// `(name: value, name: value)`.
+fn parse_arguments(var c: Cur) -> [GqlArgNode]
+    var out: [GqlArgNode] = []
+    if not eat(var c, "punct", "(")
+        return out
+    while not failed(c) and not on_punct(c, ")")
+        if at_end(c)
+            pfail(var c, "unterminated argument list")
+        else
+            let start = tok(c)
+            let nm = want_name(var c, "an argument name")
+            if not eat(var c, "punct", ":")
+                pfail(var c, "expected `:` after the argument name")
+            else
+                let v = parse_value_node(var c)
+                out = list.push(out, GqlArgNode { name: nm, value: v, loc: loc_of(start) })
+    want(var c, "punct", ")")
+    out
+
+// `{ selections }`, and the depth and breadth bounds with it.
+fn parse_selection_set(var c: Cur) -> [GqlSelection]
+    var sels: [GqlSelection] = []
+    if not eat(var c, "punct", "{")
+        pfail(var c, "expected a selection set")
+        return sels
+    c.depth = c.depth + 1
+    if c.lim.max_depth > 0 and c.depth > c.lim.max_depth
+        limit_fail(var c, "depth", c.depth, c.lim.max_depth)
+    while not failed(c) and not on_punct(c, "}")
+        if at_end(c)
+            pfail(var c, "a selection set that runs to the end of the document")
+        elif not can_select(c)
+            pfail(var c, "expected a field name")
+        else
+            sels = list.push(sels, parse_selection(var c))
+            if c.lim.max_breadth > 0 and list.len(sels) > c.lim.max_breadth
+                limit_fail(var c, "breadth", list.len(sels), c.lim.max_breadth)
+    want(var c, "punct", "}")
+    c.depth = c.depth - 1
+    sels
+
+// One selection: a field, a fragment spread, or an inline fragment.
+fn parse_selection(var c: Cur) -> GqlSelection
+    if on_punct(c, "...")
+        return parse_spread(var c)
+    parse_field(var c)
+
+// `...`: a spread when a fragment name follows, and an inline fragment
+// when `on`, a directive, or a selection set does.
+//
+// The specification reserves `on` as a fragment name for exactly this
+// reason, so `...on User` is always a type condition.
+fn parse_spread(var c: Cur) -> GqlSelection
+    let start = bump(var c)
+    if kind(c) == "name" and say(c) != "on"
+        let nm = want_name(var c, "a fragment name")
+        c.spreads = c.spreads + 1
+        if c.lim.max_spreads > 0 and c.spreads > c.lim.max_spreads
+            limit_fail(var c, "spreads", c.spreads, c.lim.max_spreads)
+        let dirs = parse_directives(var c)
+        return selection_of("spread", nm, "", [], dirs, "", [], start)
+    var cond = ""
+    if eat(var c, "name", "on")
+        cond = want_name(var c, "a type condition")
+    let dirs = parse_directives(var c)
+    var sels: [GqlSelection] = []
+    if not on_punct(c, "{")
+        pfail(var c, "an inline fragment needs a selection set")
+    else
+        sels = parse_selection_set(var c)
+    selection_of("inline", "", "", [], dirs, cond, sels, start)
+
+// A field, `name`, `alias: name`, with arguments, directives and an
+// optional selection set.
+fn parse_field(var c: Cur) -> GqlSelection
+    let start = tok(c)
+    let first = want_name(var c, "a field name")
+    var alias_text = ""
+    var fname = first
+    if on_punct(c, ":")
+        c.i = c.i + 1
+        alias_text = first
+        fname = want_name(var c, "a field name after the alias")
+        count_alias(var c)
+    let args = parse_arguments(var c)
+    let dirs = parse_directives(var c)
+    var sels: [GqlSelection] = []
+    if on_punct(c, "{")
+        sels = parse_selection_set(var c)
+    selection_of("field", fname, alias_text, args, dirs, "", sels, start)
+
+// The alias bound: one field resolved many times from a short document
+// is what a depth limit does not see.
+fn count_alias(var c: Cur)
+    c.aliases = c.aliases + 1
+    if c.lim.max_aliases > 0 and c.aliases > c.lim.max_aliases
+        limit_fail(var c, "aliases", c.aliases, c.lim.max_aliases)
+
+// `fragment Name on Type { … }`.
+fn parse_fragment(var c: Cur) -> GqlFragment
+    let start = bump(var c)
+    if say(c) == "on"
+        pfail(var c, "a fragment cannot be named `on`")
+    let nm = want_name(var c, "a fragment name")
+    if not eat(var c, "name", "on")
+        pfail(var c, "expected `on` after the fragment name")
+    let cond = want_name(var c, "a type condition")
+    let dirs = parse_directives(var c)
+    var sels: [GqlSelection] = []
+    if not on_punct(c, "{")
+        pfail(var c, "a fragment needs a selection set")
+    else
+        sels = parse_selection_set(var c)
+    GqlFragment { name: nm, type_condition: cond, directives: dirs,
+                  selections: sels, loc: loc_of(start) }
+
+// ── Values as written ────────────────────────────────────────────────
+
+// One value, of whichever of § 2.9's nine kinds is written.
+fn parse_value_node(var c: Cur) -> GqlValueNode
+    let start = tok(c)
+    if on_punct(c, "$")
+        c.i = c.i + 1
+        let nm = want_name(var c, "a variable name")
+        return value_node("variable", nm, [], [], start)
+    let k = kind(c)
+    if k == "int" or k == "float" or k == "string"
+        let t = bump(var c)
+        return value_node(t.kind, t.text, [], [], start)
+    if k == "name"
+        let t = bump(var c)
+        if t.text == "true" or t.text == "false"
+            return value_node("boolean", t.text, [], [], start)
+        if t.text == "null"
+            return value_node("null", "", [], [], start)
+        return value_node("enum", t.text, [], [], start)
+    if on_punct(c, "[")
+        c.i = c.i + 1
+        return parse_list_value(var c, start)
+    if on_punct(c, "{")
+        c.i = c.i + 1
+        return parse_object_value(var c, start)
+    pfail(var c, "expected a value")
+    value_node("null", "", [], [], start)
+
+// `[value, value]`.  An empty list is a value.
+fn parse_list_value(var c: Cur, start: Tok) -> GqlValueNode
+    var items: [GqlValueNode] = []
+    while not failed(c) and not on_punct(c, "]")
+        if at_end(c)
+            pfail(var c, "a list value that runs to the end of the document")
+        else
+            items = list.push(items, parse_value_node(var c))
+    want(var c, "punct", "]")
+    value_node("list", "", items, [], start)
+
+// `{name: value, name: value}`, keeping the names parallel to the
+// values because an object's field ORDER is part of what was written.
+fn parse_object_value(var c: Cur, start: Tok) -> GqlValueNode
+    var names: [Str] = []
+    var items: [GqlValueNode] = []
+    while not failed(c) and not on_punct(c, "}")
+        if at_end(c)
+            pfail(var c, "an object value that runs to the end of the document")
+        else
+            let nm = want_name(var c, "an object field name")
+            if not eat(var c, "punct", ":")
+                pfail(var c, "expected `:` after an object field name")
+            else
+                items = list.push(items, parse_value_node(var c))
+                names = list.push(names, nm)
+    want(var c, "punct", "}")
+    value_node("object", "", items, names, start)
+
+// ── Types as written ─────────────────────────────────────────────────
+
+// A type, `[User!]!`.
+fn parse_type_node(var c: Cur) -> GqlTypeRef
+    if eat(var c, "punct", "[")
+        let inner = parse_type_node(var c)
+        if not eat(var c, "punct", "]")
+            pfail(var c, "expected `]` to close the list type")
+        var required = false
+        if eat(var c, "punct", "!")
+            required = true
+        return wrap_list(inner, required)
+    let nm = want_name(var c, "a type name")
+    var required = false
+    if eat(var c, "punct", "!")
+        required = true
+    base_type(nm, required)
+
+// A named type, with or without its non-null marker.
+//
+// The marker list is indexed by LEVEL and is `depth + 1` long, the
+// named type's own marker at index 0 — so a NULLABLE named type writes
+// its `false` rather than writing nothing.  Writing nothing shifted
+// every wrapper's marker down one index: `[String]!` came out as a
+// one-marker type whose marker `is_non_null` reads at index 1 and does
+// not find, so a non-null list answered "not non-null" and the printer
+// answered `[String!]` for it.  `wrap_list` pushes exactly one marker
+// per wrapper, which is what keeps the index a level.
+fn base_type(name: Str, required: Bool) -> GqlTypeRef
+    GqlTypeRef { name: name, list_depth: 0, non_null: [required] }
+
+// A type with one more list wrapper around it.
+fn wrap_list(inner: GqlTypeRef, required: Bool) -> GqlTypeRef
+    let flags = list.push(list.clone(inner.non_null), required)
+    GqlTypeRef { name: inner.name, list_depth: inner.list_depth + 1, non_null: flags }
+
+// ── Joined text ──────────────────────────────────────────────────────
+
+// Two strings end to end, written as a call because a `+` inside a
+// match arm leaks a cell even when the arm is not taken.  The `+` can be
+// written back at the site on a toolchain that releases it.
+fn cat(parts: [Str]) -> Str
+    str.join(parts, "")
+
+// The non-empty parts, joined with a space.
+fn spaced(parts: [Str]) -> Str
+    var out: [Str] = []
+    for p in parts
+        if str.len(p) > 0
+            out = list.push(out, p)
+    str.join(out, " ")
+
+// One level of nesting, as two spaces.
+fn pad(n: Int) -> Str
+    str.repeat("  ", n)
+
+// A string as GraphQL writes one: quoted, with the escapes the
+// specification defines.
+fn quote_gql_string(s: Str) -> Str
+    var parts: [Str] = ["\""]
+    parts = list.concat(parts, list.map(str.chars(s), c => gql_escape(c)))
+    parts = list.push(parts, "\"")
+    str.join(parts, "")
+
+fn gql_escape(c: Str) -> Str
+    match c
+        "\""   => "\\\""
+        "\\"   => "\\\\"
+        "\n"   => "\\n"
+        "\r"   => "\\r"
+        "\t"   => "\\t"
+        "\x08" => "\\b"
+        "\x0C" => "\\f"
+        _      =>
+            if str.len(c) == 1 and (str.byte_at(c, 0) ?? 0) < 32
+                return "\\u" + hex4(str.byte_at(c, 0) ?? 0)
+            c
+
+// Four lower-case hex digits — `\uXXXX` as § 2.9.3 writes one.
+fn hex4(n: Int) -> Str
+    var digits: [Str] = []
+    var v = n
+    for _ in 0..4
+        digits = list.push(digits, hex_digit(v % 16))
+        v = v / 16
+    digits = list.reverse(digits)
+    str.join(digits, "")
+
+fn hex_digit(v: Int) -> Str
+    if v < 10
+        return str.from_char(48 + v)
+    str.from_char(87 + v)
+
 // The conventional limits.
 //
 // ```novo
@@ -202,7 +1046,8 @@ pub struct GqlLimits
 //     println("${gqllang.default_limits().max_depth}")
 // ```
 pub fn default_limits() -> GqlLimits []
-    todo("graphql-nv.gqllang.default_limits")
+    GqlLimits { max_depth: 15, max_breadth: 100, max_bytes: 65536,
+                max_aliases: 100, max_spreads: 256 }
 
 // Limits with no ceiling at all.
 //
@@ -218,7 +1063,8 @@ pub fn default_limits() -> GqlLimits []
 //     println("${gqllang.no_limits().max_depth}")
 // ```
 pub fn no_limits() -> GqlLimits []
-    todo("graphql-nv.gqllang.no_limits")
+    GqlLimits { max_depth: 0, max_breadth: 0, max_bytes: 0,
+                max_aliases: 0, max_spreads: 0 }
 
 // Limits a caller chose.
 //
@@ -230,7 +1076,8 @@ pub fn no_limits() -> GqlLimits []
 // ```
 pub fn limits(max_depth: Int, max_breadth: Int, max_bytes: Int, max_aliases: Int,
               max_spreads: Int) -> GqlLimits []
-    todo("graphql-nv.gqllang.limits")
+    GqlLimits { max_depth: max_depth, max_breadth: max_breadth, max_bytes: max_bytes,
+                max_aliases: max_aliases, max_spreads: max_spreads }
 
 // ── Parsing ──────────────────────────────────────────────────────────
 
@@ -252,7 +1099,21 @@ pub fn limits(max_depth: Int, max_breadth: Int, max_bytes: Int, max_aliases: Int
 //         Err(_) => println("not an executable document")
 // ```
 pub fn parse_executable(source: Str, lim: GqlLimits) -> Result<GqlDocument, gqlerr.GqlFault> []
-    todo("graphql-nv.gqllang.parse_executable")
+    if lim.max_bytes > 0 and str.len(source) > lim.max_bytes
+        return Err(GqlTooLarge("bytes", str.len(source), lim.max_bytes))
+    let toks = lex(source)!
+    document_from(toks, lim)
+
+// The descent, once the source is tokens.
+fn document_from(toks: [Tok], lim: GqlLimits) -> Result<GqlDocument, gqlerr.GqlFault>
+    var c = Cur { toks: toks, i: 0, lim: lim, fault: None,
+                  depth: 0, aliases: 0, spreads: 0 }
+    let d = parse_document(var c)
+    if failed(c)
+        return Err(the_fault(c))
+    if list.len(d.operations) == 0 and list.len(d.fragments) == 0
+        return Err(GqlSyntaxError("a document needs at least one definition", 1, 1))
+    Ok(d)
 
 // The operation a request means (§ 6.1).
 //
@@ -273,7 +1134,18 @@ pub fn parse_executable(source: Str, lim: GqlLimits) -> Result<GqlDocument, gqle
 //                 Err(_) => println("which operation?")
 // ```
 pub fn operation_of(d: GqlDocument, name: Str) -> Result<GqlOperation, gqlerr.GqlFault> []
-    todo("graphql-nv.gqllang.operation_of")
+    if str.len(name) == 0 and list.len(d.operations) != 1
+        return Err(GqlOperationNotFound(""))
+    match find_operation(d.operations, name)
+        Some(op) => Ok(op)
+        None     => Err(GqlOperationNotFound(name))
+
+fn find_operation(ops: [GqlOperation], name: Str) -> ?GqlOperation
+    var found: ?GqlOperation = None
+    for op in ops
+        if found == None and (str.len(name) == 0 or op.name == name)
+            found = Some(op)
+    found
 
 // A fragment by name, or `None`.
 //
@@ -289,7 +1161,16 @@ pub fn operation_of(d: GqlDocument, name: Str) -> Result<GqlOperation, gqlerr.Gq
 //                 None    => println("no such fragment")
 // ```
 pub fn fragment_of(d: GqlDocument, name: Str) -> ?GqlFragment []
-    todo("graphql-nv.gqllang.fragment_of")
+    find_fragment(d.fragments, name)
+
+fn find_fragment(frags: [GqlFragment], name: Str) -> ?GqlFragment
+    var found: ?GqlFragment = None
+    for f in frags
+        if found == None and f.name == name
+            found = Some(f)
+    found
+
+// ── Printing ─────────────────────────────────────────────────────────
 
 // A document printed back out, canonically.
 //
@@ -308,7 +1189,9 @@ pub fn fragment_of(d: GqlDocument, name: Str) -> ?GqlFragment []
 //         Ok(d)  => println(gqllang.print_document(d))
 // ```
 pub fn print_document(d: GqlDocument) -> Str []
-    todo("graphql-nv.gqllang.print_document")
+    var parts: [Str] = list.map(d.operations, op => print_operation(op))
+    parts = list.concat(parts, list.map(d.fragments, f => print_fragment(f)))
+    str.join(parts, "\n\n")
 
 // One selection set printed, for a diagnostic.
 //
@@ -324,7 +1207,89 @@ pub fn print_document(d: GqlDocument) -> Str []
 //                 Ok(op) => println(gqllang.print_selections(op.selections))
 // ```
 pub fn print_selections(ss: [GqlSelection]) -> Str []
-    todo("graphql-nv.gqllang.print_selections")
+    print_selection_set(ss, 0)
+
+// The keyword an operation kind is written with.
+fn op_word(k: GqlOpKind) -> Str
+    match k
+        GqlQuery        => "query"
+        GqlMutation     => "mutation"
+        GqlSubscription => "subscription"
+
+// Whether an operation is written in the shorthand form § 2.3 defines,
+// which has no keyword and no name.
+fn is_shorthand(op: GqlOperation) -> Bool
+    if str.len(op.name) > 0
+        return false
+    if str.len(print_var_defs(op.variables)) > 0 or str.len(print_directives(op.directives)) > 0
+        return false
+    match op.kind
+        GqlQuery => true
+        _        => false
+
+fn print_operation(op: GqlOperation) -> Str
+    let body = print_selection_set(op.selections, 0)
+    if is_shorthand(op)
+        return body
+    let head = spaced([op_word(op.kind), op.name, print_var_defs(op.variables),
+                       print_directives(op.directives)])
+    cat([head, " ", body])
+
+fn print_fragment(f: GqlFragment) -> Str
+    let head = spaced(["fragment", f.name, cat(["on ", f.type_condition,
+                                                print_directives(f.directives)])])
+    cat([head, " ", print_selection_set(f.selections, 0)])
+
+fn print_selection_set(ss: [GqlSelection], indent: Int) -> Str
+    if list.is_empty(ss)
+        return "{}"
+    var lines: [Str] = ["{"]
+    lines = list.concat(lines, list.map(ss, s => cat([pad(indent + 1), print_selection(s, indent + 1)])))
+    lines = list.push(lines, cat([pad(indent), "}"]))
+    str.join(lines, "\n")
+
+fn print_selection(s: GqlSelection, indent: Int) -> Str
+    let head = cat([print_selection_head(s), print_arguments(s.args),
+                    print_directives(s.directives)])
+    if list.is_empty(s.selections)
+        return head
+    cat([head, " ", print_selection_set(s.selections, indent)])
+
+// `alias: name`, `name`, `...Fragment`, or `... on Type`.
+fn print_selection_head(s: GqlSelection) -> Str
+    if s.kind == "spread"
+        return cat(["...", s.name])
+    if s.kind == "inline"
+        return inline_head(s.type_condition)
+    if str.len(s.alias_name) == 0
+        return s.name
+    cat([s.alias_name, ": ", s.name])
+
+fn inline_head(cond: Str) -> Str
+    if str.len(cond) == 0
+        return "..."
+    cat(["... on ", cond])
+
+fn print_arguments(args: [GqlArgNode]) -> Str
+    if list.is_empty(args)
+        return ""
+    var parts: [Str] = list.map(args, a => cat([a.name, ": ", print_value(a.value)]))
+    cat(["(", str.join(parts, ", "), ")"])
+
+fn print_directives(dirs: [GqlDirectiveNode]) -> Str
+    var parts: [Str] = list.map(dirs, d => cat(["@", d.name, print_arguments(d.args)]))
+    cat(parts)
+
+fn print_var_defs(vars: [GqlVarDef]) -> Str
+    if list.is_empty(vars)
+        return ""
+    var parts: [Str] = []
+    for v in vars
+        var piece = cat(["$", v.name, ": ", print_type(v.type_ref)])
+        if let Some(dv) = v.default_value
+            piece = cat([piece, " = ", print_value(dv)])
+        parts = list.push(parts, cat([piece, print_directives(v.directives)]))
+    cat(["(", str.join(parts, ", "), ")"])
 
 // ── Values ───────────────────────────────────────────────────────────
 
@@ -339,7 +1304,24 @@ pub fn print_selections(ss: [GqlSelection]) -> Str []
 //     println(gqllang.print_value(gqllang.parse_value("{a: 1}") ?? gqllang.null_value()))
 // ```
 pub fn print_value(v: GqlValueNode) -> Str []
-    todo("graphql-nv.gqllang.print_value")
+    match v.kind
+        "variable" => cat(["$", v.text])
+        "string"   => quote_gql_string(v.text)
+        "null"     => "null"
+        "list"     => print_value_list(v.items)
+        "object"   => print_value_object(v)
+        _          => v.text
+
+fn print_value_list(items: [GqlValueNode]) -> Str
+    var parts: [Str] = list.map(items, v => print_value(v))
+    cat(["[", str.join(parts, ", "), "]"])
+
+fn print_value_object(v: GqlValueNode) -> Str
+    var parts: [Str] = []
+    for k in 0..list.len(v.items)
+        parts = list.push(parts, cat([list.get(v.names, k, ""), ": ",
+                                      print_value(list.get(v.items, k, null_value()))]))
+    cat(["{", str.join(parts, ", "), "}"])
 
 // A standalone value, for a default or a directive argument read out
 // of context.
@@ -353,7 +1335,17 @@ pub fn print_value(v: GqlValueNode) -> Str []
 //         None    => println("not a value")
 // ```
 pub fn parse_value(source: Str) -> ?GqlValueNode []
-    todo("graphql-nv.gqllang.parse_value")
+    match lex(source)
+        Err(_)   => None
+        Ok(toks) => value_from(toks)
+
+fn value_from(toks: [Tok]) -> ?GqlValueNode
+    var c = Cur { toks: toks, i: 0, lim: no_limits(), fault: None,
+                  depth: 0, aliases: 0, spreads: 0 }
+    let v = parse_value_node(var c)
+    if failed(c) or not at_end(c)
+        return None
+    Some(v)
 
 // The `null` literal as a value node.
 //
@@ -370,7 +1362,7 @@ pub fn parse_value(source: Str) -> ?GqlValueNode []
 //     println(gqllang.null_value().kind)
 // ```
 pub fn null_value() -> GqlValueNode []
-    todo("graphql-nv.gqllang.null_value")
+    value_node("null", "", [], [], Tok { kind: "null", text: "", line: 0, col: 0 })
 
 // ── Types as written ─────────────────────────────────────────────────
 
@@ -385,7 +1377,17 @@ pub fn null_value() -> GqlValueNode []
 //         None    => println("not a type")
 // ```
 pub fn parse_type(source: Str) -> ?GqlTypeRef []
-    todo("graphql-nv.gqllang.parse_type")
+    match lex(source)
+        Err(_)   => None
+        Ok(toks) => type_from(toks)
+
+fn type_from(toks: [Tok]) -> ?GqlTypeRef
+    var c = Cur { toks: toks, i: 0, lim: no_limits(), fault: None,
+                  depth: 0, aliases: 0, spreads: 0 }
+    let t = parse_type_node(var c)
+    if failed(c) or not at_end(c)
+        return None
+    Some(t)
 
 // A type reference printed back out.
 //
@@ -398,7 +1400,20 @@ pub fn parse_type(source: Str) -> ?GqlTypeRef []
 //         Some(t) => println(gqllang.print_type(t))
 // ```
 pub fn print_type(t: GqlTypeRef) -> Str []
-    todo("graphql-nv.gqllang.print_type")
+    var out = t.name
+    // `non_null` is indexed by level and is SHORT where the innermost
+    // named type is nullable: `[String]` is `[false]` where `[String!]`
+    // is `[true, false]`.  Reading the level and not the length is what
+    // keeps `[String]` from printing as `[String!]` — the length answers
+    // "is there a marker at all", which is true of every list type.
+    if list.get(t.non_null, 0, false)
+        out = cat([out, "!"])
+    for k in 1..=t.list_depth
+        if list.get(t.non_null, k, false)
+            out = cat(["[", out, "]!"])
+        else
+            out = cat(["[", out, "]"])
+    out
 
 // A named type with no wrappers.
 //
@@ -409,7 +1424,7 @@ pub fn print_type(t: GqlTypeRef) -> Str []
 //     println(gqllang.print_type(gqllang.named_type("String")))
 // ```
 pub fn named_type(name: Str) -> GqlTypeRef []
-    todo("graphql-nv.gqllang.named_type")
+    base_type(name, false)
 
 // Whether the OUTERMOST level of a type is non-null.
 //
@@ -426,7 +1441,9 @@ pub fn named_type(name: Str) -> GqlTypeRef []
 //         Some(t) => println("${gqllang.is_non_null(t)}")
 // ```
 pub fn is_non_null(t: GqlTypeRef) -> Bool []
-    todo("graphql-nv.gqllang.is_non_null")
+    if list.len(t.non_null) <= t.list_depth
+        return false
+    list.get(t.non_null, t.list_depth, false)
 
 // Whether the outermost level is a list.
 //
@@ -439,7 +1456,7 @@ pub fn is_non_null(t: GqlTypeRef) -> Bool []
 //         Some(t) => println("${gqllang.is_list(t)}")
 // ```
 pub fn is_list(t: GqlTypeRef) -> Bool []
-    todo("graphql-nv.gqllang.is_list")
+    t.list_depth > 0
 
 // The type one wrapper in: `[User!]!` becomes `[User!]`, then `User!`,
 // then `User`.
@@ -455,7 +1472,15 @@ pub fn is_list(t: GqlTypeRef) -> Bool []
 //         Some(t) => println(gqllang.print_type(gqllang.inner_type(t)))
 // ```
 pub fn inner_type(t: GqlTypeRef) -> GqlTypeRef []
-    todo("graphql-nv.gqllang.inner_type")
+    if is_non_null(t)
+        if t.list_depth == 0
+            return GqlTypeRef { name: t.name, list_depth: 0, non_null: [false] }
+        return GqlTypeRef { name: t.name, list_depth: t.list_depth,
+                            non_null: list.push(list.slice(t.non_null, 0, t.list_depth), false) }
+    if t.list_depth > 0
+        return GqlTypeRef { name: t.name, list_depth: t.list_depth - 1,
+                            non_null: list.slice(t.non_null, 0, t.list_depth) }
+    t
 
 // ── Measurements ─────────────────────────────────────────────────────
 
@@ -474,7 +1499,40 @@ pub fn inner_type(t: GqlTypeRef) -> GqlTypeRef []
 //         Ok(d)  => println("${gqllang.depth_of(d)}")
 // ```
 pub fn depth_of(d: GqlDocument) -> Int []
-    todo("graphql-nv.gqllang.depth_of")
+    var deepest = 0
+    for op in d.operations
+        let n = walk_depth(op.selections, d.fragments, [])
+        if n > deepest
+            deepest = n
+    for f in d.fragments
+        let n = walk_depth(f.selections, d.fragments, [f.name])
+        if n > deepest
+            deepest = n
+    deepest
+
+fn walk_depth(ss: [GqlSelection], frags: [GqlFragment], open: [Str]) -> Int
+    var deepest = 0
+    for s in ss
+        var n = 0
+        if s.kind == "spread"
+            n = spread_depth(s.name, frags, open)
+        elif s.kind == "inline"
+            n = walk_depth(s.selections, frags, open)
+        else
+            n = 1 + walk_depth(s.selections, frags, open)
+        if n > deepest
+            deepest = n
+    deepest
+
+// A spread's own depth: the fragment's selections, and none if the
+// fragment is missing or already open — a cycle is `gqlcheck`'s to
+// report, and a measurement that followed one would not terminate.
+fn spread_depth(name: Str, frags: [GqlFragment], open: [Str]) -> Int
+    if list.contains(open, name)
+        return 0
+    match find_fragment(frags, name)
+        Some(f) => walk_depth(f.selections, frags, list.push(list.clone(open), name))
+        None    => 0
 
 // How many aliases a document uses.
 //
@@ -491,7 +1549,20 @@ pub fn depth_of(d: GqlDocument) -> Int []
 //         Ok(d)  => println("${gqllang.alias_count(d)}")
 // ```
 pub fn alias_count(d: GqlDocument) -> Int []
-    todo("graphql-nv.gqllang.alias_count")
+    var n = 0
+    for op in d.operations
+        n = n + count_aliases(op.selections)
+    for f in d.fragments
+        n = n + count_aliases(f.selections)
+    n
+
+fn count_aliases(ss: [GqlSelection]) -> Int
+    var n = 0
+    for s in ss
+        if str.len(s.alias_name) > 0
+            n = n + 1
+        n = n + count_aliases(s.selections)
+    n
 
 // How many fields a document names in total, fragments expanded.
 //
@@ -508,7 +1579,38 @@ pub fn alias_count(d: GqlDocument) -> Int []
 //         Ok(d)  => println("${gqllang.field_count(d)}")
 // ```
 pub fn field_count(d: GqlDocument) -> Int []
-    todo("graphql-nv.gqllang.field_count")
+    var n = 0
+    for op in d.operations
+        n = n + walk_fields(op.selections, d.fragments, [])
+    // A document of fragments alone has no operation to be measured
+    // through, so its own fragments are measured.  A document WITH an
+    // operation has already counted every field of every fragment that
+    // operation spreads — that is what "fragments expanded" means — and
+    // counting those fields a second time here answered twice for one
+    // written field: `{ ...A a: me } fragment A on Q { b: me }` was 3
+    // where the document names two fields.
+    if list.is_empty(d.operations)
+        for f in d.fragments
+            n = n + walk_fields(f.selections, d.fragments, [f.name])
+    n
+
+fn walk_fields(ss: [GqlSelection], frags: [GqlFragment], open: [Str]) -> Int
+    var n = 0
+    for s in ss
+        if s.kind == "field"
+            n = n + 1 + walk_fields(s.selections, frags, open)
+        elif s.kind == "spread"
+            n = n + spread_fields(s.name, frags, open)
+        else
+            n = n + walk_fields(s.selections, frags, open)
+    n
+
+fn spread_fields(name: Str, frags: [GqlFragment], open: [Str]) -> Int
+    if list.contains(open, name)
+        return 0
+    match find_fragment(frags, name)
+        Some(f) => walk_fields(f.selections, frags, list.push(list.clone(open), name))
+        None    => 0
 
 // The response key of a selection: its alias where it has one, its
 // name otherwise.
@@ -531,7 +1633,9 @@ pub fn field_count(d: GqlDocument) -> Int []
 //                                       gqllang.field_selection("x"))))
 // ```
 pub fn response_key(s: GqlSelection) -> Str []
-    todo("graphql-nv.gqllang.response_key")
+    if str.len(s.alias_name) > 0
+        return s.alias_name
+    s.name
 
 // A bare field selection, for building a document by hand and for a
 // default in a lookup.
@@ -543,4 +1647,4 @@ pub fn response_key(s: GqlSelection) -> Str []
 //     println(gqllang.field_selection("me").name)
 // ```
 pub fn field_selection(name: Str) -> GqlSelection []
-    todo("graphql-nv.gqllang.field_selection")
+    selection_of("field", name, "", [], [], "", [], Tok { kind: "name", text: name, line: 0, col: 0 })

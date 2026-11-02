@@ -1,12 +1,16 @@
 // gqlhttp_tests.nv — the transport, whose whole content is policy.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: graphql-nv.gqlhttp.<fn>`.
-//
 // THE STATUS TABLE IS THE POINT OF THIS FILE.  A response carrying
 // `errors` is a 200 as long as execution began, and a client library
 // that retried on 5xx would — against a server that answered 500 for a
 // failed resolver — retry every partial success forever.
+//
+// Three cases go past the table's own two lines and are pinned because
+// the implementation has to answer them: a response carrying errors
+// and NO `data` member is the 400 the modern media type asks for, a
+// fault that is the SCHEMA's is a 500 rather than the client's 400,
+// and the legacy media type's fault body carries the `"data": null`
+// its clients were read by.
 
 use std.test
 use std.list
@@ -150,6 +154,15 @@ fn test_a_response_with_errors_is_a_200_because_execution_began() [io]
     test.assert(gqlhttp.status_for(r, legacy()) == 200)
     test.assert(gqlhttp.status_for(r, modern()) == 200)
 
+    test.case("and a response with errors and NO data member never executed")
+    // The other half of the table: this response is a fault written as
+    // a response, which is what a caller that refuses a request builds
+    // — and the new media type asks for the 400 its `status_for_fault`
+    // answers.
+    let bad = gqlexec.error_response([gqlerr.error("no such field")])
+    test.assert(gqlhttp.status_for(bad, legacy()) == 200)
+    test.assert(gqlhttp.status_for(bad, modern()) == 400)
+
 @test
 fn test_a_request_that_never_executed_is_a_200_or_a_400_by_media_type() [io]
     let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
@@ -164,6 +177,15 @@ fn test_a_request_that_never_executed_is_a_200_or_a_400_by_media_type() [io]
     let v = gqlerr.GqlValidationFailed([gqlerr.error("no such field")])
     test.assert(gqlhttp.status_for_fault(v, legacy()) == 200)
     test.assert(gqlhttp.status_for_fault(v, modern()) == 400)
+
+    test.case("and a fault that is the SCHEMA's is a 500 under both")
+    // Every request against a deployment with a broken schema fails
+    // identically until somebody fixes it, so answering the client's
+    // 400 would tell it to fix its document.  `gqlerr` keeps that
+    // distinction and this is the caller that has to use it.
+    let s = gqlerr.GqlSchemaInvalid("no such type")
+    test.assert(gqlhttp.status_for_fault(s, legacy()) == 500)
+    test.assert(gqlhttp.status_for_fault(s, modern()) == 500)
 
 @test
 fn test_a_content_type_carries_a_charset_because_somebodys_name_has_an_accent() [io]
@@ -182,6 +204,14 @@ fn test_a_fault_has_a_body_in_the_media_type_negotiated() [io]
     test.case("the errors are in it")
     let f = gqlerr.GqlSyntaxError("unexpected `}`", 1, 12)
     test.assert(str.contains(gqlhttp.fault_body(f, legacy()), "errors"))
+
+    test.case("and the legacy body carries the null data its clients read")
+    // The media type decides more than the status: under
+    // `application/json` a request error's body carries
+    // `"data": null`, and under `application/graphql-response+json`
+    // `data` MUST NOT be there at all.
+    test.assert(str.contains(gqlhttp.fault_body(f, legacy()), "\"data\":null"))
+    test.assert(not str.contains(gqlhttp.fault_body(f, modern()), "\"data\""))
 
 @test
 fn test_a_request_from_a_form_on_another_site_cannot_carry_json() [io]

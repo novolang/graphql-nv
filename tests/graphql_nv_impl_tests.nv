@@ -1,0 +1,1597 @@
+// graphql_nv_impl_tests.nv — the lines the oracle suites leave.
+//
+// Each `tests/<module>_tests.nv` states the design: what a module
+// promises, one case per promise.  What they do not do is run every
+// branch of every body — a lexer's escape table, a printer's block
+// string, a validator's second rule for the same section, an
+// executor's list path.  This file walks those branches, one section
+// per module, because § 6 of the brief asks every instrumented line
+// under `src/` to be covered by a suite or excused by a marker, and a
+// test is the answer wherever the line is reachable at all.
+//
+// The assertions here are deliberately SHALLOW — a call is made and
+// something about its answer is asserted, not the whole answer.  The
+// deep assertions live in the oracle suites.  What this file buys is
+// that the line ran.
+
+use std.json
+use std.list
+use std.str
+use std.test
+use formurl
+use gqlerr
+use gqlexec
+use gqlcheck
+use gqllang
+use gqlsdl
+use gqlhttp
+use gqlintro
+
+// ── gqlerr ───────────────────────────────────────────────────────────
+
+@test
+fn test_every_fault_says_what_it_refused_in_one_line() [io]
+    // `GqlFault`'s `Error` implementation, one arm per variant.  A
+    // fault is printed by anything that reports errors — the `main`
+    // that returned it, a log, a test — and each variant has its own
+    // sentence.
+    test.case("a syntax error names its place")
+    test.assert(str.contains(gqlerr.GqlSyntaxError("unexpected `}`", 3, 12).message(),
+                             "line 3, column 12"))
+
+    test.case("a failed document says how many errors it carries")
+    let v = gqlerr.GqlValidationFailed([gqlerr.error("no"), gqlerr.error("nor")])
+    test.assert(str.contains(v.message(), "(2)"))
+
+    test.case("a schema's own message, unchanged")
+    test.assert_eq_str(gqlerr.GqlSchemaInvalid("no such type `User`").message(),
+                       "no such type `User`")
+
+    test.case("a malformed request's own message, unchanged")
+    test.assert_eq_str(gqlerr.GqlRequestMalformed("the body is not JSON").message(),
+                       "the body is not JSON")
+
+    test.case("an operation nobody named says which name was asked for")
+    test.assert(str.contains(gqlerr.GqlOperationNotFound("Viewer").message(), "Viewer"))
+
+    test.case("and variables that do not fit count their errors")
+    let w = gqlerr.GqlVariablesInvalid([gqlerr.error("id")])
+    test.assert(str.contains(w.message(), "(1)"))
+
+@test
+fn test_extensions_that_are_not_json_are_not_a_crash() [io]
+    // `code_of` reads `extensions` as JSON, and a deployment may put
+    // anything there — including something this parser cannot read.
+    // The answer is no code rather than a fault at the call site.
+    test.case("a code is read out of the extensions object")
+    let e = gqlerr.error_with_code("no", "FORBIDDEN")
+    test.assert_eq_str(gqlerr.code_of(e), "FORBIDDEN")
+
+    test.case("extensions that do not parse answer no code")
+    let broken = gqlerr.with_extensions(gqlerr.error("no"), "{not json")
+    test.assert_eq_str(gqlerr.code_of(broken), "")
+
+    test.case("and an error with no extensions at all answers no code, without parsing")
+    test.assert_eq_str(gqlerr.code_of(gqlerr.error("no")), "")
+
+@test
+fn test_the_error_json_carries_extensions_when_there_are_any() [io]
+    // § 7.1.2's fourth member.  A client that branches on a code
+    // branches on this, and an error without extensions must not
+    // carry an empty object either.
+    test.case("with a code")
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error_with_code("no", "FORBIDDEN")),
+                             "\"extensions\":{\"code\":\"FORBIDDEN\"}"))
+
+    test.case("and without one there is no member at all")
+    test.assert(not str.contains(gqlerr.error_json(gqlerr.error("no")), "extensions"))
+
+@test
+fn test_json_escaping_is_byte_by_byte_because_a_message_is_the_clients_text() [io]
+    // A message is a `Str`, which is bytes, and a message carrying a
+    // quote, a backslash or a control byte must still produce JSON a
+    // client can parse.  RFC 8259's escapes, one case per row of the
+    // table, and a control byte below 32 that has no short escape.
+    test.case("the two escapes that must not pass through")
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("a\\b")), "\\\\"))
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("say \"no\"")), "\\\""))
+
+    test.case("the three with one-letter escapes")
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("one\ntwo")), "\\n"))
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("one\ttwo")), "\\t"))
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("one\rtwo")), "\\r"))
+
+    test.case("a control byte with no short escape becomes \\u00xx")
+    // 0x0B is the vertical tab: both nibbles are below sixteen and the
+    // low one is above nine, which is the hex digit's own second arm.
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("one\x0btwo")), "\\u000b"))
+
+    test.case("and everything else passes through unchanged")
+    test.assert(str.contains(gqlerr.error_json(gqlerr.error("café ▝")), "café ▝"))
+
+@test
+fn test_every_fault_becomes_the_error_list_a_response_carries() [io]
+    // The bridge between the two vocabularies.  A schema fault and a
+    // malformed request are errors with no location; a bound that was
+    // crossed becomes the sentence that names it.
+    test.case("a schema fault")
+    let a = gqlerr.errors_of(gqlerr.GqlSchemaInvalid("no such type `User`"))
+    test.assert(list.len(a) == 1)
+    test.assert(str.contains(list.get(a, 0, gqlerr.error("")).message, "User"))
+
+    test.case("a malformed request")
+    let b = gqlerr.errors_of(gqlerr.GqlRequestMalformed("the body is not JSON"))
+    test.assert(list.len(b) == 1)
+
+    test.case("a bound that was crossed, with its numbers")
+    let c = gqlerr.errors_of(gqlerr.GqlTooLarge("depth", 40, 15))
+    test.assert(str.contains(list.get(c, 0, gqlerr.error("")).message, "40"))
+
+    test.case("an operation nobody named")
+    let d = gqlerr.errors_of(gqlerr.GqlOperationNotFound("Viewer"))
+    test.assert(str.contains(list.get(d, 0, gqlerr.error("")).message, "Viewer"))
+
+    test.case("and a feature this package does not serve")
+    let e = gqlerr.errors_of(gqlerr.GqlUnsupported("subscription"))
+    test.assert(str.contains(list.get(e, 0, gqlerr.error("")).message, "subscription"))
+
+    test.case("and a schema fault is not a request error")
+    // § 7.1's distinction decides whether the response carries a
+    // `data` member at all, and a schema the deployment cannot serve
+    // is not something the client did.
+    test.assert(not gqlerr.is_request_error(gqlerr.GqlSchemaInvalid("no")))
+    test.assert(gqlerr.is_request_error(gqlerr.GqlRequestMalformed("no")))
+
+    test.case("a variable failure answers the errors it already holds, not a sentence")
+    let vf = gqlerr.GqlVariablesInvalid([gqlerr.error("the variable `\$n` does not fit")])
+    let w = gqlerr.errors_of(vf)
+    test.assert(list.len(w) == 1)
+    test.assert(str.contains(list.get(w, 0, gqlerr.error("")).message, "\$n"))
+
+    test.case("and `is_client_safe` is the schema's own fault and nothing else")
+    test.assert(not gqlerr.is_client_safe(gqlerr.GqlSchemaInvalid("no")))
+    test.assert(gqlerr.is_client_safe(gqlerr.GqlSyntaxError("no", 1, 1)))
+    test.assert(gqlerr.is_client_safe(vf))
+
+// ── gqlhttp ──────────────────────────────────────────────────────────
+
+// The policy every transport case below starts from, changed one field
+// at a time: a policy is the whole content of this module.
+fn no_extensions() -> gqlhttp.GqlHttpPolicy
+    GqlHttpPolicy { allow_get: true, allow_get_mutation: false,
+                    max_body_bytes: 4096, read_extensions: false }
+
+fn narrow() -> gqlhttp.GqlHttpPolicy
+    GqlHttpPolicy { allow_get: true, allow_get_mutation: false,
+                    max_body_bytes: 16, read_extensions: true }
+
+fn post_only() -> gqlhttp.GqlHttpPolicy
+    GqlHttpPolicy { allow_get: false, allow_get_mutation: false,
+                    max_body_bytes: 4096, read_extensions: true }
+
+fn form(text: Str) -> formurl.FormBody
+    formurl.parse_str(text)
+
+@test
+fn test_a_body_that_names_the_wrong_type_for_a_member_is_refused_by_name() [io]
+    // One refusal per member, each naming the member.  A single "bad
+    // request" about a forty-line body is not something a developer
+    // can act on.
+    test.case("`query` is not a string")
+    match gqlhttp.read_post("{\"query\":5}", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "query"))
+
+    test.case("`operationName` is not a string")
+    let body = "{\"query\":\"{ me }\",\"operationName\":5}"
+    match gqlhttp.read_post(body, gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "operationName"))
+
+    test.case("and `extensions` is not an object")
+    let ext = "{\"query\":\"{ me }\",\"extensions\":5}"
+    match gqlhttp.read_post(ext, gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "extensions"))
+
+@test
+fn test_a_body_that_is_json_and_is_not_an_object_is_refused() [io]
+    // `5`, `"text"` and `[]` are all JSON and none is a request.
+    test.case("a number")
+    match gqlhttp.read_post("5", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "not an object"))
+
+    test.case("and an array")
+    match gqlhttp.read_post("[]", gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "not an object"))
+
+@test
+fn test_a_body_over_the_policys_ceiling_is_refused_with_the_numbers() [io]
+    // The ceiling is a deployment's own number, and the refusal names
+    // it so an operator can raise it.
+    test.case("a body over the ceiling")
+    match gqlhttp.read_post("{\"query\":\"{ me }\"}", narrow())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "16"))
+
+    test.case("and a body under it is read")
+    match gqlhttp.read_post("{\"query\":\"x\"}", narrow())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.query, "x")
+
+@test
+fn test_extensions_are_read_only_where_the_policy_says_so() [io]
+    // A deployment that does not serve persisted queries does not read
+    // the member at all — and the request is still a request.
+    test.case("a POST body's extensions, with the policy off")
+    let body = "{\"query\":\"{ me }\",\"extensions\":{\"a\":1}}"
+    match gqlhttp.read_post(body, no_extensions())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.extensions, "")
+
+    test.case("a form body's extensions, with the policy off")
+    match gqlhttp.read_form(form("query=%7Bme%7D&extensions=%7B%7D"), no_extensions())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_eq_str(r.extensions, "")
+
+@test
+fn test_a_form_parameter_that_is_not_json_is_refused_by_name() [io]
+    // `variables` and `extensions` arrive as text in a query string,
+    // so each has to be parsed before it is a JSON object.
+    test.case("`variables` is not JSON")
+    match gqlhttp.read_form(form("query=%7Bme%7D&variables=notjson"), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "variables"))
+
+    test.case("`variables` is JSON and not an object")
+    match gqlhttp.read_form(form("query=%7Bme%7D&variables=5"), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "not a JSON object"))
+
+    test.case("and `extensions` is not JSON")
+    match gqlhttp.read_form(form("query=%7Bme%7D&extensions=notjson"), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "extensions"))
+
+@test
+fn test_a_form_a_deployment_refuses_is_refused_by_name_for_each_reason() [io]
+    test.case("GET is off entirely")
+    match gqlhttp.read_form(form("query=%7Bme%7D"), post_only())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "405"))
+
+    test.case("a repeated `variables` parameter")
+    let v = "query=%7Bme%7D&variables=%7B%7D&variables=%7B%7D"
+    match gqlhttp.read_form(form(v), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "variables"))
+
+    test.case("a repeated `extensions` parameter")
+    let e = "query=%7Bme%7D&extensions=%7B%7D&extensions=%7B%7D"
+    match gqlhttp.read_form(form(e), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "extensions"))
+
+    test.case("and no `query` parameter at all")
+    match gqlhttp.read_form(form("variables=%7B%7D"), gqlhttp.defaults())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "query"))
+
+@test
+fn test_a_subscription_is_not_a_mutation_and_a_get_may_carry_one() [io]
+    // `refuses_get_mutation` is about writes.  A subscription over GET
+    // resolves nothing, so the CSRF the rule exists for is not there —
+    // and the executor refuses the operation itself, later and by name.
+    test.case("a query is not refused")
+    test.assert(not gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlQuery))
+
+    test.case("a mutation is")
+    test.assert(gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlMutation))
+
+    test.case("and a subscription is not")
+    test.assert(not gqlhttp.refuses_get_mutation(gqlhttp.defaults(), gqllang.GqlSubscription))
+
+@test
+fn test_a_response_that_carries_data_is_a_200_whatever_else_it_carries() [io]
+    // The table's first row, and the one the whole status function
+    // exists for: execution began, so the answer is a success.
+    test.case("data and errors together")
+    let r = GqlResponse { data: "{\"me\":{\"name\":null}}",
+                          errors: [gqlerr.at(gqlerr.error("no"), 1, 4)],
+                          extensions: "" }
+    test.assert(gqlhttp.status_for(r, gqlhttp.legacy_media()) == 200)
+    test.assert(gqlhttp.status_for(r, gqlhttp.modern_media()) == 200)
+
+fn with_ext(query: Str, ext: Str) -> gqlexec.GqlRequest
+    GqlRequest { query: query, operation_name: "", variables: "", extensions: ext }
+
+@test
+fn test_a_persisted_query_hash_is_read_out_of_the_extensions() [io]
+    // Apollo's `persistedQuery` object.  A deployment serving
+    // persisted queries reads it BEFORE it reads the query, so the
+    // three shapes — a hash, no `persistedQuery`, and extensions that
+    // are not JSON — all have to answer something.
+    test.case("the hash")
+    let req = with_ext("{ me }", "{\"persistedQuery\":{\"sha256Hash\":\"abc123\"}}")
+    test.assert_eq_str(gqlhttp.persisted_hash(req), "abc123")
+
+    test.case("an object with no `persistedQuery` in it")
+    test.assert_eq_str(gqlhttp.persisted_hash(with_ext("{ me }", "{\"a\":1}")), "")
+
+    test.case("a `persistedQuery` with no hash in it")
+    let bare = with_ext("{ me }", "{\"persistedQuery\":{\"version\":1}}")
+    test.assert_eq_str(gqlhttp.persisted_hash(bare), "")
+
+    test.case("extensions that are not JSON at all")
+    test.assert_eq_str(gqlhttp.persisted_hash(with_ext("{ me }", "{not json")), "")
+
+    test.case("and a request with no extensions")
+    test.assert_eq_str(gqlhttp.persisted_hash(with_ext("{ me }", "")), "")
+
+// ── gqlintro ─────────────────────────────────────────────────────────
+
+// A schema with every kind in it, one member per branch the emit side
+// and the read side each have: a custom scalar, two interfaces (one
+// implementing the other), two objects implementing both, a union, an
+// enum with a deprecated value, an input object with a default, and a
+// custom directive whose argument is a non-null list — which is the
+// only place an argument's type has to be drawn without a schema to
+// look its kind up in.
+const RICH_SDL = "scalar Date\n"
+    + "interface Node { id: ID! }\n"
+    + "interface Pet implements Node { id: ID! name: String! }\n"
+    + "type Dog implements Pet & Node { id: ID! name: String! barks: Boolean @deprecated(reason: \"it never barks\") }\n"
+    + "type Cat implements Pet & Node { id: ID! name: String! purrs: Boolean @deprecated }\n"
+    + "union Animal = Dog | Cat\n"
+    + "enum Size { SMALL LARGE @deprecated(reason: \"use SMALL\") }\n"
+    + "input PetFilter { size: Size limit: Int = 10 }\n"
+    + "directive @tag(names: [String!]!, why: String) on FIELD_DEFINITION\n"
+    + "type Query { pets(filter: PetFilter): [Pet!]! animal: Animal born: Date! }\n"
+
+fn rich() -> gqlsdl.GqlSchema
+    match gqlsdl.build(RICH_SDL)
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+@test
+fn test_a_schema_with_every_kind_in_it_survives_its_own_introspection() [io]
+    // The emit side and the read side meet here: the document a
+    // registry or a gateway is handed, and the schema a gateway reads
+    // back out of it.  A branch that neither side reaches is a member
+    // of this schema that is missing from the round trip.
+    test.case("the schema builds")
+    test.assert(list.len(rich().types) >= 8)
+
+    test.case("the document names the kinds and the members")
+    let doc = gqlintro.document(rich())
+    test.assert(str.contains(doc, "\"__schema\""))
+    test.assert(str.contains(doc, "INPUT_OBJECT"))
+    test.assert(str.contains(doc, "UNION"))
+    test.assert(str.contains(doc, "specifiedByURL"))
+
+    test.case("and it reads back as the schema it was taken from")
+    match gqlintro.schema_of(doc)
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert_eq_str(back.query_type, "Query")
+            test.assert(list.len(back.types) >= 8)
+            match gqlsdl.type_named(back, "Animal")
+                Some(t) => test.assert(list.contains(t.members, "Dog"))
+                None    => test.assert(false)
+
+    test.case("a type whose name is not in the schema answers nothing")
+    test.assert_none(gqlintro.type_value(rich(), gqlintro.defaults(), "NoSuchType"))
+
+@test
+fn test_a_schema_object_read_on_its_own_is_still_a_schema_document() [io]
+    // A caller may have the response, its `data`, or the schema object
+    // itself in hand — three shapes, and the reader takes all three.
+    test.case("the schema object itself, with the types and the root")
+    let bare = "{\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\","
+        + "\"fields\":[{\"name\":\"me\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"}}]}],"
+        + "\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(bare)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+@test
+fn test_a_document_that_is_not_an_introspection_result_says_what_is_missing() [io]
+    // "Invalid introspection result" about a forty-thousand-line
+    // document is not something anybody can act on.
+    test.case("not JSON at all")
+    match gqlintro.schema_of("<html>")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "JSON"))
+
+    test.case("JSON with no `__schema` anywhere in it")
+    match gqlintro.schema_of("{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "__schema"))
+
+    test.case("a `__schema` with no `types` array")
+    match gqlintro.schema_of("{\"__schema\":{\"queryType\":{\"name\":\"Query\"}}}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "types"))
+
+    test.case("a `__schema` with no query root, which § 3.3 requires")
+    match gqlintro.schema_of("{\"__schema\":{\"types\":[]}}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "queryType"))
+
+    test.case("a `data` member with no `__schema` under it")
+    // The third shape: the caller has the RESULT and the schema object
+    // is beside `data` rather than under it.
+    let wrapped = "{\"data\":{},\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\","
+        + "\"fields\":[]}],\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(wrapped)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+@test
+fn test_a_type_entry_the_reader_cannot_use_is_a_sentence_and_not_a_crash() [io]
+    // A document from another server is data, and data is wrong in
+    // ways this package never emits.  Each wrong shape is a named
+    // problem rather than a fault with no place in it.
+    test.case("a `types` entry with no name is skipped, not fatal")
+    // What `read_types` filters is what `read_type` never sees: a
+    // member with no name cannot be a type, so the entry is dropped
+    // and the rest of the document still reads.
+    let nameless = "{\"types\":[{\"kind\":\"OBJECT\"},"
+        + "{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":[]}],"
+        + "\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(nameless)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert_eq_str(s.query_type, "Query")
+
+    test.case("a `types` entry whose kind is not one")
+    let wrong = "{\"__schema\":{\"types\":[{\"kind\":\"NON_NULL\",\"name\":\"X\"}],"
+        + "\"queryType\":{\"name\":\"Query\"}}}"
+    match gqlintro.schema_of(wrong)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "NON_NULL"))
+
+    test.case("a wrapper with nothing inside it, and a member with no type")
+    // `LIST` with no `ofType` is a chain that ends in nothing, and a
+    // field entry with no `type` member is a field nothing can be
+    // read for — both fall back to `String` rather than refusing the
+    // document, because a gateway is better off with a schema than
+    // with nothing.
+    let broken = "{\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":["
+        + "{\"name\":\"a\",\"type\":{\"kind\":\"LIST\"}},"
+        + "{\"name\":\"b\",\"type\":{\"kind\":\"SCALAR\"}},"
+        + "{\"name\":\"c\"}]}],"
+        + "\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(broken)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match gqlsdl.field_named(s, "Query", "a")
+                Some(f) => test.assert(str.len(f.type_ref.name) > 0)
+                None    => test.assert(false)
+
+    test.case("a list of nullable members, and a wrapper doubled on itself")
+    // `[String]` is a LIST whose inner is not NON_NULL, and a NON_NULL
+    // around another NON_NULL is a chain no server should emit and a
+    // gateway may still be handed.  Both are read, neither is fatal.
+    let odd = "{\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":["
+        + "{\"name\":\"a\",\"type\":{\"kind\":\"LIST\",\"ofType\":{\"kind\":\"SCALAR\",\"name\":\"String\"}}},"
+        + "{\"name\":\"b\",\"type\":{\"kind\":\"NON_NULL\",\"ofType\":{\"kind\":\"NON_NULL\",\"ofType\":{\"kind\":\"SCALAR\",\"name\":\"String\"}}}},"
+        + "{\"name\":\"c\",\"type\":{\"kind\":\"SCALAR\",\"name\":\"String\"},\"isDeprecated\":true}]}],"
+        + "\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(odd)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match gqlsdl.field_named(s, "Query", "a")
+                Some(f) => test.assert(f.type_ref.list_depth == 1)
+                None    => test.assert(false)
+            // § 4.5 gives `@deprecated` a default reason, so a member
+            // that is deprecated with no reason still has one.
+            match gqlsdl.field_named(s, "Query", "c")
+                Some(f) => test.assert_eq_str(f.deprecated, "No longer supported")
+                None    => test.assert(false)
+
+@test
+fn test_a_custom_directive_travels_and_comes_back() [io]
+    // A directive is a schema's own vocabulary, and a document that
+    // dropped the deployment's directives would hand a gateway half a
+    // schema.
+    test.case("the directive is in the document")
+    let doc = gqlintro.document(rich())
+    test.assert(str.contains(doc, "\"tag\""))
+
+    test.case("and reads back with its argument")
+    match gqlintro.schema_of(doc)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            var found = false
+            for d in s.directives
+                if d.name == "tag"
+                    found = list.len(d.args) > 0
+            test.assert(found)
+
+    test.case("a document whose `locations` list carries something else")
+    // A location that is not a string is a location this reader cannot
+    // use, and the ones it can use still arrive.
+    let doc2 = "{\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":[]}],"
+        + "\"queryType\":{\"name\":\"Query\"},"
+        + "\"directives\":[{\"name\":\"tag\",\"locations\":[\"FIELD\",5],\"args\":[]}]}"
+    match gqlintro.schema_of(doc2)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            var read = false
+            for d in s.directives
+                if d.name == "tag"
+                    read = list.contains(d.locations, "FIELD")
+            test.assert(read)
+
+@test
+fn test_a_document_naming_a_type_it_never_defined_is_refused_by_name() [io]
+    // The reader is lenient about a WRAPPER it cannot draw — a LIST
+    // with nothing inside it is a field, not a broken document — and
+    // strict about a NAME it cannot resolve, because a union with a
+    // member that is not in the document is a schema half-received.
+    // That difference is why `build_from` validates references.
+    let doc = "{\"types\":[{\"kind\":\"OBJECT\",\"name\":\"Query\",\"fields\":["
+        + "{\"name\":\"search\",\"type\":{\"kind\":\"UNION\",\"name\":\"Animal\"}}]},"
+        + "{\"kind\":\"UNION\",\"name\":\"Animal\",\"possibleTypes\":[{\"kind\":\"OBJECT\",\"name\":\"Ghost\"}]}],"
+        + "\"queryType\":{\"name\":\"Query\"},\"directives\":[]}"
+    match gqlintro.schema_of(doc)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "Ghost"))
+
+@test
+fn test_a_guess_is_offered_only_when_it_is_close_enough_to_help() [io]
+    // A suggestion is a disclosure of the schema, one field at a time,
+    // so it is made only where the name the client typed is nearly the
+    // name that exists.
+    test.case("a field one letter away")
+    test.assert(str.contains(gqlintro.suggest_field(rich(), gqlintro.defaults(),
+                                                    "Query", "petz"),
+                                                    "pets"))
+
+    test.case("a name nothing is near")
+    test.assert_eq_str(gqlintro.suggest_field(rich(), gqlintro.defaults(),
+                                              "Query", "zzzzzzzzzzzzzzzzzz"),
+                                              "")
+
+    test.case("a type the schema does not have")
+    test.assert_eq_str(gqlintro.suggest_field(rich(), gqlintro.defaults(),
+                                              "NoSuchType", "x"),
+                                              "")
+
+    test.case("and a policy with the suggestions off")
+    test.assert_eq_str(gqlintro.suggest_field(rich(), gqlintro.closed(), "Query", "petz"), "")
+
+// ── gqlcheck ─────────────────────────────────────────────────────────
+//
+// The module with the most branches and the fewest oracle cases per
+// branch: § 5 is twenty-two rules, and a rule whose refusal never fires
+// in a test is a rule nobody has read.  The documents below are short
+// on purpose — each one exists to make one branch fire — and the
+// assertions are deliberately shallow.  The deep assertions live in
+// `tests/gqlcheck_tests.nv`.
+
+const CHECK_SDL = "scalar Date\n"
+    + "enum Size { SMALL LARGE }\n"
+    + "input PetFilter { size: Size tags: [String!] }\n"
+    + "input Needful { n: Int! }\n"
+    + "directive @noop on QUERY\n"
+    + "type Query {\n"
+    + "  me: String\n"
+    + "  self: Query\n"
+    + "  count(n: Int!): Int\n"
+    + "  ratio(f: Float): Float\n"
+    + "  ok(b: Boolean): Boolean\n"
+    + "  tag(s: String): String\n"
+    + "  key(id: ID): ID\n"
+    + "  sized(size: Size): Size\n"
+    + "  filtered(filter: PetFilter): Int\n"
+    + "  needful(n: Needful): Int\n"
+    + "  several(tags: [String!]!): Int\n"
+    + "  when(at: Date): Date\n"
+    + "}\n"
+    + "type Mutation { doIt(n: Int): Int }\n"
+    + "type Subscription { tick: Int }"
+
+fn check_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build(CHECK_SDL)
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "",
+                              description: "" }
+
+fn check_doc(src: Str) -> gqllang.GqlDocument
+    match gqllang.parse_executable(src, gqllang.no_limits())
+        Ok(d)  => d
+        Err(_) => GqlDocument { operations: [], fragments: [] }
+
+// Everything `validate` says about a document.  A document that does
+// not parse answers one loud error rather than nothing at all, so a
+// guard with a typo in it fails an assertion instead of passing one.
+fn check_all(s: gqlsdl.GqlSchema, src: Str) -> [gqlerr.GqlError]
+    match gqllang.parse_executable(src, gqllang.no_limits())
+        Ok(d)  => gqlcheck.validate(s, d)
+        Err(_) => [gqlerr.error("this document does not parse, so the guard is misspelled")]
+
+fn said(errs: [gqlerr.GqlError], needle: Str) -> Bool
+    var found = false
+    for e in errs
+        if str.contains(e.message, needle)
+            found = true
+    found
+
+fn pref(text: Str) -> gqllang.GqlTypeRef
+    match gqllang.parse_type(text)
+        None    => GqlTypeRef { name: "NoSuchType", list_depth: 0, non_null: [false] }
+        Some(t) => t
+
+// The one selection of a one-operation document, because `@skip` and
+// `@include` are answered one selection at a time.
+fn only_selection(src: Str) -> gqllang.GqlSelection
+    let d = check_doc(src)
+    match gqllang.operation_of(d, "")
+        Err(_) => gqllang.field_selection("")
+        Ok(op) => list.get(op.selections, 0, gqllang.field_selection(""))
+
+@test
+fn test_a_literal_of_every_kind_fits_the_type_it_is_written_for() [io]
+    // § 5.6.1's table, one literal per row: `Int`, `Float`, `String`,
+    // `Boolean`, `ID` twice (the specification takes a string AND an
+    // integer), an enum name, an input object with a list inside it,
+    // a list, a custom scalar this package cannot judge, `null` where
+    // the type is nullable, and a variable — which is § 5.8.5's
+    // question and deliberately not one of this package's rules.
+    let s = check_schema()
+    test.case("every literal kind, once")
+    test.assert(list.len(check_all(s, "query Q(\$flag: Boolean!) {"
+            + " count(n: 1) ratio(f: 1.5) ok(b: true) tag(s: \"x\")"
+            + " k1: key(id: \"k\") k2: key(id: 1) sized(size: SMALL)"
+            + " filtered(filter: { size: SMALL, tags: [\"a\"] })"
+            + " needful(n: { n: 1 }) several(tags: [\"a\", \"b\"])"
+            + " when(at: \"2026-13-45\") me @skip(if: \$flag) }")) == 0)
+
+    test.case("null where the type is nullable, and a variable wherever")
+    test.assert(list.len(check_all(s, "query Q(\$n: Int!) { ratio(f: null) count(n: \$n) }")) == 0)
+
+    test.case("and a variable inside a list literal is still a use")
+    test.assert(list.len(check_all(s, "query Q(\$a: String!) { several(tags: [\$a]) }")) == 0)
+
+@test
+fn test_a_literal_that_does_not_fit_is_refused_with_its_text_and_its_type() [io]
+    // The refusal is the sentence a developer acts on, so it carries
+    // both halves: what they wrote, and what the schema asked for.
+    let s = check_schema()
+    test.case("an integer argument written as a string")
+    test.assert(said(check_all(s, "{ count(n: \"one\") }"), "`Int!`"))
+
+    test.case("a required argument written as null")
+    test.assert(said(check_all(s, "{ count(n: null) }"), "`Int!`"))
+
+    test.case("a list where the type has no list level")
+    test.assert(said(check_all(s, "{ count(n: [1]) }"), "is written as `[1]`"))
+
+    test.case("a scalar where the type is a list")
+    test.assert(said(check_all(s, "{ several(tags: \"a\") }"), "`[String!]!`"))
+
+    test.case("an enum name that is not one of the enum's")
+    test.assert(said(check_all(s, "{ sized(size: HUGE) }"), "`Size`"))
+
+    test.case("an input object with a member it does not have")
+    test.assert(said(check_all(s, "{ filtered(filter: { nope: 1 }) }"), "`PetFilter`"))
+
+    test.case("an input object missing a member that is required")
+    test.assert(said(check_all(s, "{ needful(n: {}) }"), "`Needful`"))
+
+    test.case("and a member of an input object of the wrong kind")
+    test.assert(said(check_all(s, "{ filtered(filter: { size: \"SMALL\" }) }"), "`PetFilter`"))
+
+    test.case("a list whose member is the wrong kind")
+    test.assert(said(check_all(s, "{ several(tags: [1]) }"), "`[String!]!`"))
+
+@test
+fn test_a_json_variable_is_fitted_by_kind_and_by_list_level() [io]
+    // The variables arrive as JSON, which is a different type system
+    // from the document's: `1.0` is a float for an `Int` here, exactly
+    // as § 2.9.1's grammar says it is, and nothing but the schema says
+    // which enum a JSON string names.
+    let s = check_schema()
+    test.case("an integer, a float, and the difference between them")
+    test.assert(gqlcheck.value_fits(s, "1", pref("Int")))
+    test.assert(not gqlcheck.value_fits(s, "1.0", pref("Int")))
+    test.assert(gqlcheck.value_fits(s, "1.5", pref("Float")))
+    test.assert(gqlcheck.value_fits(s, "1", pref("Float")))
+
+    test.case("a string and a boolean")
+    test.assert(gqlcheck.value_fits(s, "\"x\"", pref("String")))
+    test.assert(not gqlcheck.value_fits(s, "1", pref("String")))
+    test.assert(gqlcheck.value_fits(s, "true", pref("Boolean")))
+
+    test.case("an ID takes a string and an integer, which surprises everybody")
+    test.assert(gqlcheck.value_fits(s, "\"k\"", pref("ID")))
+    test.assert(gqlcheck.value_fits(s, "7", pref("ID")))
+
+    test.case("a list's members are fitted one level down")
+    test.assert(gqlcheck.value_fits(s, "[1, 2]", pref("[Int]")))
+    test.assert(not gqlcheck.value_fits(s, "[1, \"two\"]", pref("[Int]")))
+    test.assert(not gqlcheck.value_fits(s, "5", pref("[Int]")))
+
+    test.case("an enum value is a JSON string whose text is the name")
+    test.assert(gqlcheck.value_fits(s, "\"SMALL\"", pref("Size")))
+    test.assert(not gqlcheck.value_fits(s, "\"HUGE\"", pref("Size")))
+
+    test.case("an input object is a JSON object, and a custom scalar is anything")
+    test.assert(gqlcheck.value_fits(s, "{}", pref("PetFilter")))
+    test.assert(not gqlcheck.value_fits(s, "5", pref("PetFilter")))
+    test.assert(gqlcheck.value_fits(s, "\"2026-13-45\"", pref("Date")))
+
+    test.case("a type the schema does not have is nothing")
+    test.assert(not gqlcheck.value_fits(s, "1", pref("NoSuchType")))
+
+    test.case("null fits where the type is nullable and not where it is not")
+    test.assert(gqlcheck.value_fits(s, "null", pref("Int")))
+    test.assert(not gqlcheck.value_fits(s, "null", pref("Int!")))
+
+    test.case("and text that is not JSON at all is nothing")
+    test.assert(not gqlcheck.value_fits(s, "{not json", pref("Int")))
+
+@test
+fn test_the_arguments_of_a_known_field_are_checked_one_by_one() [io]
+    // § 5.4: every argument is defined on the field, no argument is
+    // written twice, every argument fits its type, and every argument
+    // the type requires is there.
+    let s = check_schema()
+    test.case("an argument the field does not take")
+    test.assert(said(check_all(s, "{ count(n: 1, m: 2) }"), "takes no argument `m`"))
+
+    test.case("the same argument twice")
+    test.assert(said(check_all(s, "{ count(n: 1, n: 2) }"), "is given `n` twice"))
+
+    test.case("a required argument that is not there")
+    test.assert(said(check_all(s, "{ count }"), "requires the argument `n`"))
+
+    test.case("an optional one that is not there is not an error")
+    test.assert(list.len(check_all(s, "{ ratio }")) == 0)
+
+    test.case("a field the type does not have is refused before its arguments are")
+    test.assert(said(check_all(s, "{ nope { me } }"), "does not exist on `Query`"))
+
+@test
+fn test_an_operation_is_checked_against_the_root_its_kind_needs() [io]
+    // § 3.3 and § 5.2.3.1.  A mutation is checked against the
+    // schema's mutation root; a schema that has none says so rather
+    // than reporting every field as unknown.
+    let s = check_schema()
+    test.case("a mutation against a schema that has a mutation root")
+    test.assert(list.len(check_all(s, "mutation { doIt(n: 1) }")) == 0)
+
+    test.case("a mutation against a schema that has none")
+    test.assert(said(check_all(rich(), "mutation { doIt }"), "has no mutation root type"))
+
+    test.case("a subscription with one root field")
+    test.assert(list.len(check_all(s, "subscription { tick }")) == 0)
+
+    test.case("and a subscription with two")
+    test.assert(said(check_all(s, "subscription { tick me }"), "one root field"))
+
+    test.case("a subscription against a schema that has no subscription root")
+    test.assert(said(check_all(rich(), "subscription { tick }"), "has no subscription root type"))
+
+    test.case("two operations with one name")
+    test.assert(said(check_all(s, "query Q { me } query Q { me }"), "defined more than once"))
+
+@test
+fn test_fragments_are_checked_as_a_graph_rather_than_one_at_a_time() [io]
+    // § 5.5.  Three of its four rules need the whole document — a name
+    // defined twice, a fragment nobody spreads, and the cycle — which
+    // is why they are answered before the walk and not inside it.
+    let s = check_schema()
+    test.case("a spread that names a fragment nobody defined")
+    test.assert(said(check_all(s, "{ me ...Ghost }"), "spread and never defined"))
+
+    test.case("a fragment that spreads a fragment nobody defined")
+    test.assert(said(check_all(s, "{ me ...A } fragment A on Query { me ...Ghost }"),
+                     "spread and never defined"))
+
+    test.case("a fragment nobody spreads")
+    test.assert(said(check_all(s, "{ me } fragment F on Query { me }"), "never spread"))
+
+    test.case("a fragment spread from inside a fragment nobody spreads")
+    test.assert(said(check_all(s, "{ me } fragment A on Query { ...B } fragment B on Query { me }"),
+                     "never spread"))
+
+    test.case("one fragment name defined twice")
+    test.assert(said(check_all(s, "{ me } fragment F on Query { me } fragment F on Query { me }"),
+                     "defined more than once"))
+
+    test.case("a cycle whose spread is nested inside a selection set")
+    test.assert(said(check_all(s, "{ me ...A } fragment A on Query { self { ...B } }"
+            + " fragment B on Query { me ...A }"),
+            "form a cycle"))
+
+    test.case("a type condition the schema does not have")
+    test.assert(said(check_all(s, "{ me ...F } fragment F on Ghost { me }"),
+                     "not a type in this schema"))
+
+    test.case("a condition that can never apply where it is spread")
+    test.assert(said(check_all(s, "{ me ...F } fragment F on Mutation { doIt }"), "can never apply"))
+
+    test.case("an inline fragment with no type condition is against its parent")
+    test.assert(list.len(check_all(s, "{ ... { me } }")) == 0)
+
+@test
+fn test_a_cycle_does_not_take_the_process_with_it() [io]
+    // A regression this file found: `first_use_loc` followed a spread
+    // into its fragment without remembering where it had been, so a
+    // cyclic document plus one undeclared variable recursed until the
+    // process died — SIGSEGV, the denial of service § 5.5.2.2's rule
+    // exists to refuse, arriving one rule later.  Both halves of the
+    // answer are expected now: the cycle AND the variable.
+    let s = check_schema()
+    let two = "{ ...A } fragment A on Query { ...B } fragment B on Query { ...A count(n: \$x) }"
+    test.case("the cycle is reported")
+    test.assert(said(check_all(s, two), "form a cycle"))
+
+    test.case("and so is the variable that is used and never declared")
+    test.assert(said(check_all(s, two), "used and never declared"))
+
+    test.case("a fragment that spreads itself is the same walk")
+    test.assert(said(check_all(s, "{ ...A } fragment A on Query { ...A count(n: \$x) }"),
+                     "used and never declared"))
+
+    test.case("and a declared variable in a cycle is not a problem at all")
+    test.assert(list.len(check_all(s, "query Q(\$x: Int!) { ...A }"
+            + " fragment A on Query { ...A count(n: \$x) }")) == 1)
+
+@test
+fn test_a_merged_selection_is_checked_as_one_set() [io]
+    // § 5.3.2.  `{ user { name } user { email } }` merges because the
+    // merged subselections are validated together; a conflict is
+    // reported at the LATER of the two places, which is the one a
+    // developer has to look at.
+    let s = check_schema()
+    test.case("the same field twice merges")
+    test.assert(list.len(check_all(s, "{ me me }")) == 0)
+
+    test.case("the same alias of the same field merges")
+    test.assert(list.len(check_all(s, "{ a: self { me } a: self { me } }")) == 0)
+
+    test.case("two selections under one key that do not merge")
+    let errs = check_all(s, "{ a: me a: count(n: 1) }")
+    test.assert(list.len(errs) == 1)
+    test.assert(list.get(list.get(errs, 0, gqlerr.error("")).locations,
+                         0, GqlLoc { line: 0, column: 0 }).column > 3)
+
+    test.case("and a merged key whose field the parent does not have")
+    test.assert(said(check_all(s, "{ nope { me } nope { me } }"), "does not exist on `Query`"))
+
+@test
+fn test_a_directive_is_refused_for_the_place_it_is_written() [io]
+    // § 5.7.2.  The location a schema declares is the specification's
+    // uppercase word — `on FIELD`, `on QUERY` — and the diagnostic
+    // says it the way a reader says it.
+    let s = check_schema()
+    test.case("on a field")
+    test.assert(said(check_all(s, "{ me @noop }"), "may not appear on a field"))
+
+    test.case("on an inline fragment")
+    test.assert(said(check_all(s, "{ ... on Query @noop { me } }"), "may not appear on an inline fragment"))
+
+    test.case("on a fragment spread")
+    test.assert(said(check_all(s, "{ me ...F @noop } fragment F on Query { me }"),
+                     "may not appear on a fragment spread"))
+
+    test.case("on a fragment definition")
+    test.assert(said(check_all(s, "{ me ...F } fragment F on Query @noop { me }"),
+                     "may not appear on a fragment definition"))
+
+    test.case("on a variable definition")
+    test.assert(said(check_all(s, "query Q(\$x: Int @noop) { count(n: 1) }"),
+                     "may not appear on a variable definition"))
+
+    test.case("on a query operation, where the schema says it may appear")
+    test.assert(list.len(check_all(s, "query Q @noop { me }")) == 0)
+
+    test.case("and on a query operation where the schema says it may not")
+    test.assert(said(check_all(s, "query Q @skip(if: true) { me }"), "may not appear on a query operation"))
+
+    test.case("on a mutation operation, which is its own location word")
+    test.assert(said(check_all(s, "mutation M @skip(if: true) { doIt(n: 1) }"),
+                     "may not appear on a mutation operation"))
+
+    test.case("and on a subscription operation")
+    test.assert(said(check_all(s, "subscription S @skip(if: true) { tick }"),
+                     "may not appear on a subscription operation"))
+
+    test.case("a non-repeatable directive written twice in one place")
+    test.assert(said(check_all(s, "query Q { me @skip(if: true) @skip(if: false) }"),
+                     "is not repeatable"))
+
+@test
+fn test_variables_are_declared_used_and_coerced_against_their_types() [io]
+    // § 5.8.3 and § 5.8.4, then § 6.1.2's coercion, which is the same
+    // question asked of the JSON a request carries rather than of the
+    // document.
+    let s = check_schema()
+    test.case("a variable used and never declared, pointed at its first use")
+    test.assert(said(check_all(s, "{ count(n: \$n) }"), "used and never declared"))
+
+    test.case("a variable used in a directive's argument is pointed at the directive")
+    test.assert(said(check_all(s, "query Q { me @skip(if: \$flag) }"), "used and never declared"))
+
+    test.case("a variable located past a spread of a fragment nobody defined")
+    test.assert(said(check_all(s, "{ me ...Ghost count(n: \$x) }"), "used and never declared"))
+
+    test.case("a variable declared and never used")
+    test.assert(said(check_all(s, "query Q(\$n: Int!) { me }"), "declared and never used"))
+
+    test.case("a variable used inside a spread fragment is used")
+    test.assert(list.len(check_all(s, "query Q(\$n: Int!) { me ...F }"
+            + " fragment F on Query { count(n: \$n) }")) == 0)
+
+    test.case("and one used inside a nested selection set")
+    test.assert(list.len(check_all(s, "query Q(\$n: Int!) { self { count(n: \$n) } }")) == 0)
+
+    test.case("coercion refuses text that is not JSON")
+    let op = gqllang.operation_of(check_doc("query Q(\$n: Int!, \$d: Int = 7) { me }"), "Q")
+    match op
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            match gqlcheck.coerce_variables(s, o, "not json")
+                Err(f) => test.assert(str.contains(f.message(), "not JSON"))
+                Ok(_)  => test.assert(false)
+
+            test.case("and JSON that is not an object")
+            match gqlcheck.coerce_variables(s, o, "[1]")
+                Err(f) => test.assert(str.contains(f.message(), "JSON object"))
+                Ok(_)  => test.assert(false)
+
+            test.case("a required variable that was not supplied")
+            match gqlcheck.coerce_variables(s, o, "{}")
+                Err(f) => test.assert(str.contains(f.message(), "do not fit"))
+                Ok(_)  => test.assert(false)
+
+            test.case("the one that was supplied, and the default for the one that was not")
+            match gqlcheck.coerce_variables(s, o, "{\"n\": 3}")
+                Ok(text) => test.assert(str.contains(text, "\"n\":3") and str.contains(text, "\"d\":7"))
+                Err(_)   => test.assert(false)
+
+            test.case("and a nullable variable nobody supplied coerces to null")
+            let nullable = gqllang.operation_of(check_doc("query Q(\$n: Int) { me }"), "Q")
+            match nullable
+                Err(_) => test.assert(false)
+                Ok(n)  =>
+                    match gqlcheck.coerce_variables(s, n, "{}")
+                        Ok(text) => test.assert(str.contains(text, "\"n\":null"))
+                        Err(_)   => test.assert(false)
+
+@test
+fn test_skip_and_include_decide_whether_a_selection_is_included() [io]
+    // § 5.7.3's two directives, and the rule that reads them: a
+    // selection is included when it is not skipped and not left out,
+    // whichever order they were written in.
+    test.case("skip with a literal")
+    test.assert(not gqlcheck.selection_included(only_selection("{ me @skip(if: true) }"), "{}"))
+    test.assert(gqlcheck.selection_included(only_selection("{ me @skip(if: false) }"), "{}"))
+
+    test.case("include, which is the other polarity")
+    test.assert(gqlcheck.selection_included(only_selection("{ me @include(if: true) }"), "{}"))
+    test.assert(not gqlcheck.selection_included(only_selection("{ me @include(if: false) }"), "{}"))
+
+    test.case("a variable's truth is read out of the variables JSON")
+    let sel = only_selection("{ me @skip(if: \$flag) }")
+    test.assert(not gqlcheck.selection_included(sel, "{\"flag\": true}"))
+    test.assert(gqlcheck.selection_included(sel, "{\"flag\": false}"))
+
+    test.case("variables that are not JSON, or that do not name it, leave it included")
+    test.assert(gqlcheck.selection_included(sel, "not json"))
+    test.assert(gqlcheck.selection_included(sel, "{}"))
+
+    test.case("a value that is neither a boolean nor a variable")
+    test.assert(gqlcheck.selection_included(only_selection("{ me @skip(if: \"yes\") }"), "{}"))
+
+    test.case("and a directive with no `if` at all")
+    test.assert(gqlcheck.selection_included(only_selection("{ me @skip }"), "{}"))
+
+    test.case("an input object that names one member twice")
+    test.assert(said(check_all(check_schema(), "{ me @include(if: { a: 1, a: 2 }) }"), "given twice"))
+
+@test
+fn test_the_rule_table_is_what_every_door_into_validation_reads() [io]
+    // `validate_only` and `validate_except` are one flag check each
+    // over the same table, `rule_section` is a look-up in it, and the
+    // rules this package does not implement are written down beside
+    // it.  A rule whose name has no section, or a name the table does
+    // not hold, is this file's bug rather than a document's.
+    let s = check_schema()
+    let d = check_doc("{ me }")
+
+    test.case("a rule's own section, and every rule in the table has one")
+    test.assert_eq_str(gqlcheck.rule_section("Composite fields must have a selection set"), "5.3.3")
+    var without = 0
+    for r in gqlcheck.rule_names()
+        if str.len(gqlcheck.rule_section(r)) == 0
+            without = without + 1
+    test.assert(without == 0)
+
+    test.case("a rule nobody has a section for answers an empty word")
+    test.assert_eq_str(gqlcheck.rule_section("Rules must be numbered"), "")
+
+    test.case("a valid document, and one that is not")
+    test.assert(gqlcheck.is_valid(s, d))
+    test.assert(not gqlcheck.is_valid(s, check_doc("{ nope }")))
+
+    test.case("only the rules that were named — and none named leaves none switched on")
+    var no_rules: [Str] = []
+    test.assert(list.len(gqlcheck.validate_only(s, d, no_rules)) == 0)
+    test.assert(list.len(gqlcheck.validate_only(s, check_doc("{ count(n: 1, n: 2) }"),
+                                                ["Arguments must be unique"])) == 1)
+
+    test.case("every rule but the ones that were named")
+    test.assert(list.len(gqlcheck.validate_except(s, d, gqlcheck.rule_names())) == 0)
+    test.assert(list.len(gqlcheck.validate_except(s, check_doc("{ nope }"),
+                                                  ["Field selections must exist on the type"])) == 0)
+
+    test.case("the rules this package does not implement are written down, with why")
+    let un = gqlcheck.unchecked_rules()
+    test.assert(list.len(un) >= 1)
+    test.assert(str.contains(list.get(un, 0, ""), "5.1.1"))
+
+@test
+fn test_three_document_refusals_the_oracle_suites_never_make_fire() [io]
+    // Each rule below has a document that reaches it and nothing else
+    // in the suites that does: a composite field with nothing under
+    // it, a directive nothing defines, and an anonymous operation
+    // sharing a document with a named one.
+    let s = check_schema()
+
+    test.case("a composite field with no selection set says which type needs one")
+    test.assert(said(check_all(s, "{ self }"), "needs a selection set"))
+
+    test.case("a directive nothing defines is named with its `@`")
+    test.assert(said(check_all(s, "{ me @nope }"), "`@nope` is not defined"))
+
+    test.case("an anonymous operation is refused only when it is not alone")
+    test.assert(said(check_all(s, "{ me } query Q { me }"),
+                     "anonymous and the document has another"))
+    test.assert(not said(check_all(s, "{ me }"), "anonymous"))
+
+@test
+fn test_the_rules_a_caller_reaches_for_one_at_a_time() [io]
+    // The four diagnostics a program asks for on their own — a merge
+    // conflict, a variable problem, an impossible fragment and a
+    // directive problem — are each one `run_checks` call with the
+    // rules that answer them.
+    let s = check_schema()
+
+    test.case("two different fields under one response key")
+    test.assert(list.len(gqlcheck.merge_conflicts(s, check_doc("{ a: me a: count(n: 1) }"))) >= 1)
+
+    test.case("a variable used before it is declared, and one declared and never used")
+    test.assert(list.len(gqlcheck.variable_problems(s, check_doc("{ count(n: \$x) }"))) >= 1)
+    test.assert(list.len(gqlcheck.variable_problems(s,
+        check_doc("query Q(\$x: Int) { me }"))) > 0)
+
+    test.case("a fragment spread on a type the operation cannot be against")
+    test.assert(list.len(gqlcheck.impossible_fragments(s,
+        check_doc("{ ...F } fragment F on Mutation { doIt }"))) > 0)
+
+    test.case("a directive nothing defines, asked for by the directive rules alone")
+    test.assert(list.len(gqlcheck.directive_problems(s, check_doc("{ me @nope }"))) >= 1)
+
+@test
+fn test_a_variable_that_does_not_fit_is_a_fault_holding_every_bad_one() [io]
+    // § 6.1.2's coercion, which runs before execution begins.  The
+    // answer is a `GqlVariablesInvalid` carrying the client's own
+    // errors — one per variable that does not fit — because a request
+    // that fixes one variable at a time is a request sent repeatedly.
+    let s = check_schema()
+    let d = check_doc("query Q(\$n: Int!, \$b: Boolean) { count(n: \$n) ok(b: \$b) }")
+
+    test.case("a JSON string where the type says Int, and another where it says Boolean")
+    match gqllang.operation_of(d, "")
+        Err(_) => test.assert(false)
+        Ok(op) =>
+            match gqlcheck.coerce_variables(s, op, "{\"n\":\"twelve\",\"b\":\"not a bool\"}")
+                Ok(_)  => test.assert(false)
+                Err(f) =>
+                    test.assert(str.contains(list.get(gqlerr.errors_of(f), 0,
+                                                      gqlerr.error("")).message,
+                                             "and its type is `Int!`"))
+
+    test.case("and the variables that do fit come back as the JSON the executor reads")
+    match gqllang.operation_of(d, "")
+        Err(_) => test.assert(false)
+        Ok(op) =>
+            match gqlcheck.coerce_variables(s, op, "{\"n\":4}")
+                Ok(v)  => test.assert(str.contains(v, "\"n\":4"))
+                Err(_) => test.assert(false)
+
+// A schema with one of everything the executor has a branch for: two
+// custom scalars, an enum, an input object, an interface, a list of
+// non-null objects and a non-null list of them, an object whose leaf is
+// non-null, a deprecated field, and both other roots.
+const EXEC_SDL = "scalar Date\n"
+    + "scalar Box\n"
+    + "enum Size { SMALL LARGE }\n"
+    + "input PetFilter { size: Size tags: [String!] }\n"
+    + "interface Named { name: String! }\n"
+    + "type Person implements Named { name: String! }\n"
+    + "type Pet implements Named {\n"
+    + "  name: String!\n  age: Int\n  size: Size\n  tags: [String!]!\n"
+    + "  old: Int @deprecated\n}\n"
+    + "type Inner { leaf: String! }\n"
+    + "type Deep { inner: Inner }\n"
+    + "type Query {\n"
+    + "  me: String\n  mustCount: Int!\n  count(n: Int): Int\n  ratio(f: Float): Float\n  ok(b: Boolean): Boolean\n"
+    + "  key(id: ID): ID\n  when: Date\n  whenMust: Date!\n  sized(size: Size): Size\n"
+    + "  echo(n: Int, tags: [String!], filter: PetFilter, k: Int = 7): Box\n"
+    + "  pets: [Pet!]\n  hardPets: [Pet!]!\n  loose: [String!]\n  hard: [String!]!\n"
+    + "  pet: Named\n  must: Named!\n  deep: Deep\n}\n"
+    + "type Mutation { bump(n: Int): Int }\n"
+    + "type Subscription { tick: Int }"
+
+// A resolver whose answers are written down, keyed by the schema's
+// `Type.field` — NOT by the response key, which is what makes the alias
+// assertion below a statement about the executor.
+//
+// Four answers are spelled as pseudo-values rather than as JSON,
+// because they are things a resolver DOES and not values it returns:
+//
+//   `@args`    answer the coerced arguments the executor built
+//   `@parent`  answer the parent value the executor passed
+//   `@fail`    `GqlFailed` — the field failed
+//   `@raw`     answer text that is not JSON at all
+struct Scripted
+    data: Str
+    concrete: Str
+    scalar: Str
+
+impl GqlResolver[] for Scripted
+    fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+        let qual = ctx.type_name + "." + ctx.field_name
+        var found = false
+        var is_string = false
+        var word = ""
+        var json_text = ""
+        match json.parse(self.data)
+            None      =>
+                found = false
+            Some(obj) =>
+                match json.get(obj, qual)
+                    Some(v) =>
+                        found = true
+                        json_text = json.stringify(v)
+                        is_string = json.type_of(v) == "string"
+                        if is_string
+                            word = json.to_str(v) ?? ""
+                    None    =>
+                        found = false
+        if not found
+            return GqlNoResolver
+        if is_string
+            if word == "@args"
+                return GqlValue(ctx.args_json)
+            if word == "@parent"
+                return GqlValue(ctx.parent_json)
+            if word == "@fail"
+                return GqlFailed(gqlerr.error("the resolver for `" + qual + "` failed"))
+            if word == "@raw"
+                return GqlValue("this is not JSON, and the null it becomes is the answer")
+        GqlValue(json_text)
+
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+        self.concrete
+
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+        if self.scalar == "fail"
+            return GqlFailed(gqlerr.error("the `" + scalar + "` scalar failed"))
+        if self.scalar == "skip"
+            return GqlNoResolver
+        GqlValue(value_json)
+
+fn answers(data: Str) -> Scripted
+    Scripted { data: data, concrete: "", scalar: "" }
+
+fn says_type(data: Str, name: Str) -> Scripted
+    Scripted { data: data, concrete: name, scalar: "" }
+
+fn scalar_mode(data: Str, mode: Str) -> Scripted
+    Scripted { data: data, concrete: "", scalar: mode }
+
+fn exec_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build(EXEC_SDL)
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "", description: "" }
+
+fn query_only_schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build("type Query { me: String }")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "", description: "" }
+
+fn run_exec(s: gqlsdl.GqlSchema, r: Scripted, src: Str,
+            vars: Str) -> Result<gqlexec.GqlResponse, gqlerr.GqlFault> [io]
+    gqlexec.execute(s, r, gqlexec.with_variables(gqlexec.request(src), vars),
+                    "{}", gqllang.default_limits())
+
+// The response, or a response that says the request was refused — so a
+// test that expected data fails on its own assertion rather than on an
+// unwrap it never wrote.
+fn ran(s: gqlsdl.GqlSchema, r: Scripted, src: Str, vars: Str) -> gqlexec.GqlResponse [io]
+    match run_exec(s, r, src, vars)
+        Ok(res) => res
+        Err(f)  => gqlexec.error_response([gqlerr.error("refused: " + f.message())])
+
+fn ran1(s: gqlsdl.GqlSchema, r: Scripted, src: Str) -> gqlexec.GqlResponse [io]
+    ran(s, r, src, "{}")
+
+fn errored(r: gqlexec.GqlResponse, needle: Str) -> Bool
+    var found = false
+    for e in r.errors
+        if str.contains(e.message, needle)
+            found = true
+    found
+
+// A fault's own sentence, or anyone's in the list it carries: a
+// `GqlValidationFailed` answers "the document failed validation" and
+// keeps the rules' sentences in its errors.
+fn fault_says(f: gqlerr.GqlFault, needle: Str) -> Bool
+    if str.contains(f.message(), needle)
+        return true
+    var found = false
+    for e in gqlerr.errors_of(f)
+        if str.contains(e.message, needle)
+            found = true
+    found
+
+@test
+fn test_an_operation_runs_against_the_root_its_kind_names() [io]
+    let s = exec_schema()
+    test.case("a mutation, from the mutation root")
+    test.assert_eq_str(ran1(s, answers("{\"Mutation.bump\":3}"), "mutation { bump }").data,
+                       "{\"bump\":3}")
+
+    test.case("and a mutation against a schema with no mutation root never runs")
+    match run_exec(query_only_schema(), answers("{\"Mutation.bump\":3}"), "mutation { bump }", "{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(fault_says(f, "mutation root"))
+
+    test.case("a subscription is refused, and the sentence the caller prints is published")
+    match run_exec(s, answers("{}"), "subscription { tick }", "{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "subscription"))
+    test.assert(str.contains(gqlexec.subscription_gap(), "transport"))
+
+    test.case("and the serial rule is answerable for every kind, not just the two")
+    test.assert(gqlexec.runs_serially(gqllang.GqlMutation))
+    test.assert(not gqlexec.runs_serially(gqllang.GqlQuery))
+    test.assert(not gqlexec.runs_serially(gqllang.GqlSubscription))
+
+@test
+fn test_the_root_json_a_deployment_passes_is_the_parent_of_every_root_field() [io]
+    let s = exec_schema()
+    test.case("the parent a root resolver is handed is the root JSON itself")
+    match gqlexec.execute(s, answers("{\"Query.echo\":\"@parent\"}"),
+                          gqlexec.request("{ echo }"), "{\"who\":\"ada\"}",
+                          gqllang.default_limits())
+        Ok(r)  => test.assert_eq_str(r.data, "{\"echo\":{\"who\":\"ada\"}}")
+        Err(_) => test.assert(false)
+
+    test.case("and a root that is not JSON at all is an empty object rather than a crash")
+    match gqlexec.execute(s, answers("{\"Query.echo\":\"@parent\"}"),
+                          gqlexec.request("{ echo }"), "not json", gqllang.default_limits())
+        Ok(r)  => test.assert_eq_str(r.data, "{\"echo\":{}}")
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_resolvers_answer_is_checked_against_the_type_the_schema_declares() [io]
+    let s = exec_schema()
+    test.case("every built-in scalar, answered with a value of its own kind")
+    let good = ran1(s, answers("{\"Query.count\":3,\"Query.ratio\":1.5,\"Query.ok\":true,"
+                               + "\"Query.key\":\"a1\"}"),
+                    "{ count ratio ok key }")
+    test.assert_eq_str(good.data, "{\"count\":3,\"ratio\":1.5,\"ok\":true,\"key\":\"a1\"}")
+
+    test.case("and with a value of another kind, which is a field error each")
+    let bad = ran1(s, answers("{\"Query.count\":3.5,\"Query.ratio\":\"wide\","
+                              + "\"Query.ok\":\"yes\",\"Query.key\":[1]}"),
+                   "{ count ratio ok key }")
+    test.assert(errored(bad, "is not a value of `Int`"))
+    test.assert(errored(bad, "is not a value of `Float`"))
+    test.assert(errored(bad, "is not a value of `Boolean`"))
+    test.assert(errored(bad, "is not a value of `ID`"))
+
+    test.case("an enum member, and a value that is not one")
+    test.assert_eq_str(ran1(s, answers("{\"Query.sized\":\"SMALL\"}"), "{ sized(size: SMALL) }").data,
+                       "{\"sized\":\"SMALL\"}")
+    test.assert(errored(ran1(s, answers("{\"Query.sized\":\"HUGE\"}"), "{ sized(size: SMALL) }"),
+                        "is not a value of `Size`"))
+
+    test.case("a wrong value on a NON-NULL scalar is not a null but the end of the response")
+    let hard = ran1(s, answers("{\"Query.mustCount\":\"nope\"}"), "{ mustCount }")
+    test.assert_eq_str(hard.data, "null")
+    test.assert(errored(hard, "is not a value of `Int!`"))
+
+    test.case("and an answer that is not JSON at all is a null, not a crash")
+    test.assert_eq_str(ran1(s, answers("{\"Query.me\":\"@raw\"}"), "{ me }").data, "{\"me\":null}")
+
+    test.case("a resolver that does not know the field is its own diagnostic")
+    test.assert(errored(ran1(s, answers("{}"), "{ me }"), "there is no resolver for `Query.me`"))
+
+    test.case("and a resolver that fails says so at the field's own path")
+    let failed = ran1(s, answers("{\"Query.me\":\"@fail\"}"), "{ me }")
+    test.assert_eq_str(failed.data, "{\"me\":null}")
+    test.assert(errored(failed, "the resolver for `Query.me` failed"))
+    test.assert_eq_str(str.join(list.get(failed.errors, 0, gqlerr.error("x")).path, "."), "me")
+
+@test
+fn test_the_arguments_of_a_field_are_coerced_before_the_resolver_sees_them() [io]
+    let s = exec_schema()
+    test.case("a variable, a list literal, an input object and a declared default")
+    let r = ran(s, answers("{\"Query.echo\":\"@args\"}"),
+                "query (\$n: Int, \$tags: [String!]) { echo(n: \$n, tags: \$tags, "
+                    + "filter: { size: SMALL }) }",
+                "{\"n\":4,\"tags\":[\"a\",\"b\"]}")
+    test.assert_eq_str(r.data,
+        "{\"echo\":{\"n\":4,\"tags\":[\"a\",\"b\"],\"filter\":{\"size\":\"SMALL\"},\"k\":7}}")
+
+    test.case("a null literal, and an argument the query left out entirely")
+    test.assert_eq_str(ran1(s, answers("{\"Query.echo\":\"@args\"}"), "{ echo(n: null, k: 3) }").data,
+                       "{\"echo\":{\"n\":null,\"tags\":null,\"filter\":null,\"k\":3}}")
+
+    test.case("a list literal, whose members are coerced one by one")
+    test.assert_eq_str(ran1(s, answers("{\"Query.echo\":\"@args\"}"),
+                            "{ echo(tags: [\"a\", \"b\"]) }").data,
+                       "{\"echo\":{\"n\":null,\"tags\":[\"a\",\"b\"],\"filter\":null,\"k\":7}}")
+
+@test
+fn test_an_abstract_type_needs_the_deployment_to_name_the_concrete_one() [io]
+    let s = exec_schema()
+    test.case("no name given: a field error, and the null stops at the nullable field")
+    let none = ran1(s, answers("{\"Query.pet\":{}}"), "{ pet { name } }")
+    test.assert_eq_str(none.data, "{\"pet\":null}")
+    test.assert(errored(none, "has no concrete type"))
+
+    test.case("and where the field is non-null the null goes all the way up")
+    test.assert_eq_str(ran1(s, answers("{\"Query.must\":\"{\\\"name\\\":\\\"a\\\"}\"}"),
+                            "{ must { name } }").data,
+                            "null")
+
+    test.case("a name that is a type but not one carrying the field is a field error")
+    test.assert(errored(ran1(s, says_type("{\"Query.pet\":{}}", "Date"),
+                              "{ pet { name } }"),
+                        "the field `name` is not on `Date`"))
+
+    test.case("and the right name answers the fields the query asked for")
+    test.assert_eq_str(ran1(s, says_type("{\"Query.pet\":\"{}\",\"Pet.name\":\"a\","
+                                         + "\"Pet.age\":4}",
+                                         "Pet"),
+                            "{ pet { name ... on Pet { age } } }").data,
+                       "{\"pet\":{\"name\":\"a\",\"age\":4}}")
+
+@test
+fn test_a_list_and_its_elements_are_nullable_separately() [io]
+    let s = exec_schema()
+    test.case("a resolver that answers a non-list for a list field is a field error")
+    let flat = ran1(s, answers("{\"Query.loose\":\"nope\",\"Query.hard\":\"nope\"}"), "{ loose hard }")
+    test.assert(errored(flat, "is not a list and the type is `[String!]`"))
+    test.assert(errored(flat, "is not a list and the type is `[String!]!`"))
+    test.assert_eq_str(flat.data, "null")
+
+    test.case("a null element where the element is non-null nulls the whole list")
+    let pets = ran1(s, answers("{\"Query.pets\":[{},{}],\"Pet.name\":null}"), "{ pets { name } }")
+    test.assert_eq_str(pets.data, "{\"pets\":null}")
+    test.assert(errored(pets, "resolved to null and its type is `String!`"))
+
+    test.case("and where the LIST is non-null too, the null goes up to the root")
+    test.assert_eq_str(ran1(s, answers("{\"Query.hardPets\":[{}],\"Pet.name\":null}"),
+                            "{ hardPets { name } }").data,
+                            "null")
+
+@test
+fn test_a_custom_scalar_is_serialized_by_the_deployment() [io]
+    let s = exec_schema()
+    test.case("the deployment's answer is what goes on the wire")
+    test.assert_eq_str(ran1(s, answers("{\"Query.when\":\"2026-10-12\"}"), "{ when }").data,
+                       "{\"when\":\"2026-10-12\"}")
+
+    test.case("a deployment with nothing to say answers the value unchanged")
+    test.assert_eq_str(ran1(s, scalar_mode("{\"Query.when\":\"2026-10-12\"}", "skip"),
+                            "{ when }").data,
+                       "{\"when\":\"2026-10-12\"}")
+
+    test.case("a serialization that fails is a field error, and a non-null one nulls its parent")
+    let soft = ran1(s, scalar_mode("{\"Query.when\":\"x\"}", "fail"), "{ when }")
+    test.assert_eq_str(soft.data, "{\"when\":null}")
+    test.assert(errored(soft, "scalar failed"))
+    test.assert_eq_str(ran1(s, scalar_mode("{\"Query.whenMust\":\"x\"}", "fail"),
+                            "{ whenMust }").data,
+                            "null")
+
+@test
+fn test_a_selection_set_is_a_graph_and_the_response_mirrors_it() [io]
+    let s = exec_schema()
+    test.case("a null at a non-null leaf inside an object nulls the nearest nullable field")
+    let deep = ran1(s, answers("{\"Query.deep\":{},\"Deep.inner\":{},\"Inner.leaf\":null}"),
+                    "{ deep { inner { leaf } } }")
+    test.assert_eq_str(deep.data, "{\"deep\":{\"inner\":null}}")
+    test.assert(errored(deep, "resolved to null and its type is `String!`"))
+
+    test.case("two selections with one response key are one field, and an alias makes two")
+    let fixture = answers("{\"Query.me\":\"Ada\"}")
+    test.assert_eq_str(ran1(s, fixture, "{ me me }").data, "{\"me\":\"Ada\"}")
+    test.assert_eq_str(ran1(s, fixture, "{ a: me b: me }").data, "{\"a\":\"Ada\",\"b\":\"Ada\"}")
+
+    test.case("a named fragment, a bare inline fragment and a typed one all expand in place")
+    test.assert_eq_str(ran1(s, answers("{\"Query.me\":\"Ada\",\"Query.count\":1}"),
+                            "query { ...bits ... { count } } fragment bits on Query { me }").data,
+                       "{\"me\":\"Ada\",\"count\":1}")
+    test.assert_eq_str(ran1(s, fixture, "{ ... on Query { me } }").data, "{\"me\":\"Ada\"}")
+
+    test.case("and a fragment whose type condition does not cover the concrete type is left out")
+    test.assert_eq_str(ran1(s, says_type("{\"Query.pet\":{},\"Pet.name\":\"a\"}", "Pet"),
+                            "{ pet { ... on Person { name } name } }").data,
+                       "{\"pet\":{\"name\":\"a\"}}")
+
+    test.case("a duplicate response key is not always the first selection")
+    test.assert_eq_str(ran1(s, answers("{\"Query.me\":\"Ada\",\"Query.count\":1}"),
+                            "{ me count me }").data,
+                            "{\"me\":\"Ada\",\"count\":1}")
+
+@test
+fn test_a_meta_field_is_answered_from_the_schema_and_not_by_the_resolver() [io]
+    let s = exec_schema()
+    test.case("__type by name, with the fields the query asked for")
+    let t = ran1(s, answers("{}"),
+                 "{ __type(name: \"Pet\") { name kind fields(includeDeprecated: false) { name } } }")
+    test.assert(str.contains(t.data, "\"name\":\"Pet\""))
+    test.assert(str.contains(t.data, "\"kind\":\"OBJECT\""))
+    test.assert(str.contains(t.data, "\"name\":\"age\""))
+
+    test.case("and through a variable — the argument form that answered null for every request")
+    test.assert_eq_str(ran(s, answers("{}"), "query (\$n: String!) { __type(name: \$n) { name } }",
+                          "{\"n\":\"Query\"}").data,
+                       "{\"__type\":{\"name\":\"Query\"}}")
+
+    test.case("a name that is not a type, and no name at all, are nulls rather than errors")
+    test.assert_eq_str(ran1(s, answers("{}"), "{ __type(name: \"Nope\") { name } }").data,
+                       "{\"__type\":null}")
+    test.assert_eq_str(ran1(s, answers("{}"), "{ __type(name: \"\") { name } }").data,
+                       "{\"__type\":null}")
+
+    test.case("__schema, and __typename with no resolver at all")
+    test.assert_eq_str(ran1(s, answers("{}"), "{ __schema { queryType { name } } }").data,
+                       "{\"__schema\":{\"queryType\":{\"name\":\"Query\"}}}")
+    test.assert_eq_str(ran1(s, answers("{}"), "{ __typename }").data, "{\"__typename\":\"Query\"}")
+
+    test.case("and a missing argument is refused by validation like any other")
+    match run_exec(s, answers("{}"), "{ __type { name } }", "{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(fault_says(f, "requires the argument `name`"))
+
+    test.case("an `includeDeprecated` the query did not write at all is the policy's default")
+    let quiet = ran1(s, answers("{}"), "{ __type(name: \"Pet\") { fields { name } } }")
+    test.assert(not str.contains(quiet.data, "\"name\":\"old\""))
+    test.assert(str.contains(quiet.data, "\"name\":\"age\""))
+
+    test.case("and a whole introspection document, member by member")
+    let deep = ran1(s, answers("{}"),
+        "query { __schema { types { name fields { name type { name } args { name type { name } } } "
+            + "enumValues { name } inputFields { name } interfaces { name } "
+            + "possibleTypes { name } ofType { name } } "
+            + "directives { name args { name type { name } } } "
+            + "queryType { name } mutationType { name } subscriptionType { name } } }")
+    test.assert(str.contains(deep.data, "\"queryType\":{\"name\":\"Query\"}"))
+    test.case("and the roots a document names come back as roots")
+    match gqlintro.schema_of(gqlintro.document(s))
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert_eq_str(back.query_type, "Query")
+            test.assert_eq_str(back.mutation_type, "Mutation")
+            test.assert_eq_str(back.subscription_type, "Subscription")
+    test.assert(str.contains(deep.data, "\"subscriptionType\":{\"name\":\"Subscription\"}"))
+    test.assert(str.contains(deep.data, "\"__InputValue\""))
+    test.assert(str.contains(deep.data, "\"possibleTypes\""))
+    test.assert(list.len(deep.errors) == 0)
+
+@test
+fn test_include_deprecated_reads_a_literal_or_a_variable() [io]
+    let s = exec_schema()
+    test.case("the literal, both ways")
+    test.assert(str.contains(ran1(s, answers("{}"),
+        "{ __type(name: \"Pet\") { fields(includeDeprecated: true) { name } } }").data,
+        "\"name\":\"old\""))
+    test.assert(not str.contains(ran1(s, answers("{}"),
+        "{ __type(name: \"Pet\") { fields(includeDeprecated: false) { name } } }").data,
+        "\"name\":\"old\""))
+
+    test.case("and the variable — the form that answered the default whatever was supplied")
+    let via = "query (\$keep: Boolean!) { __type(name: \"Pet\") "
+        + "{ fields(includeDeprecated: \$keep) { name } } }"
+    test.assert(str.contains(ran(s, answers("{}"), via, "{\"keep\":true}").data, "\"name\":\"old\""))
+    test.assert(not str.contains(ran(s, answers("{}"), via, "{\"keep\":false}").data, "\"name\":\"old\""))
+
+@test
+fn test_the_start_up_coverage_check_names_the_fields_a_resolver_never_answers() [io]
+    let s = exec_schema()
+    test.case("a field nothing answers is named, and a field that failed is not")
+    let gaps = gqlexec.check_coverage(s, answers("{\"Query.count\":1,\"Query.me\":\"@fail\"}"))
+    test.assert(list.contains(gaps, "Query.ratio"))
+    test.assert(not list.contains(gaps, "Query.count"))
+    test.assert(not list.contains(gaps, "Query.me"))
+
+@test
+fn test_null_lands_at_names_the_field_a_null_stops_at() [io]
+    let s = exec_schema()
+    test.case("a path with a list index in it, which names no field of its own")
+    test.assert_eq_str(str.join(gqlexec.null_lands_at(s, "Query", ["pets", "0", "name"]), "/"),
+                       "pets")
+    test.case("a path that names a field which is not there")
+    test.assert(list.len(gqlexec.null_lands_at(s, "Query", ["nope"])) == 0)
+    test.case("a chain of non-null fields has nowhere to stop, so the root is the answer")
+    test.assert(list.len(gqlexec.null_lands_at(s, "Query", ["hardPets", "0", "name"])) == 0)
+
+@test
+fn test_the_two_doors_a_caller_who_already_has_a_document_comes_in_by() [io]
+    // `execute_document` is the entry point for a caller that has
+    // parsed already — a gateway holding a persisted query, a test
+    // that built its document — and `with_operation` is how a request
+    // names the operation once the document is in hand.
+    let s = query_only_schema()
+
+    test.case("a document that is already parsed runs without being re-parsed")
+    match gqlexec.execute_document(s, answers("{\"Query.me\":\"ada\"}"), check_doc("{ me }"),
+                                   "", "{}", "{}")
+        Ok(r)  => test.assert_eq_str(r.data, "{\"me\":\"ada\"}")
+        Err(_) => test.assert(false)
+
+    test.case("and a name no operation in the document has is refused by its name")
+    match gqlexec.execute_document(s, answers("{}"), check_doc("{ me }"), "Me", "{}", "{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(fault_says(f, "Me"))
+
+    test.case("a variable that does not fit its declared type is refused before execution")
+    // The request-error half of § 7.1: no `data` member at all, and
+    // the fault is the coercion's own, not a field's.  The document
+    // has to be a VALID one, or validation refuses it first and the
+    // coercion is never reached.
+    let vd = check_doc("query Q(\$n: Int) { count(n: \$n) }")
+    match gqlexec.execute_document(exec_schema(), answers("{}"), vd, "",
+                                   "{\"n\":\"twelve\"}", "{}")
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(list.len(gqlerr.errors_of(f)) == 1)
+
+    test.case("and a query that is not a document at all never becomes an execution")
+    match gqlexec.execute(s, answers("{}"), gqlexec.request("this is not a query"),
+                          "{}", gqllang.default_limits())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(list.len(gqlerr.errors_of(f)) == 1)
+
+    test.case("the operation name is a field a caller sets on a request")
+    let req = gqlexec.with_operation(gqlexec.request("{ me }"), "Me")
+    test.assert_eq_str(req.operation_name, "Me")
+    test.assert_eq_str(req.query, "{ me }")
+    test.assert_eq_str(req.variables, "")
+
+// ── gqllang ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_type_ref_is_asked_about_its_outermost_wrapper() [io]
+    // § 2.11's two questions are asked at different levels, and this is
+    // the one that decides whether a null may stop here: the marker at
+    // the type ref's own list depth, not the innermost one.
+    test.assert(gqllang.is_non_null(pref("String!")))
+    test.assert(not gqllang.is_non_null(pref("String")))
+    test.assert(not gqllang.is_non_null(pref("[String!]")))
+    test.assert(gqllang.is_non_null(pref("[String!]!")))
+
+    test.case("and a ref a caller built with fewer markers than levels answers false")
+    // `GqlTypeRef` is a public struct, so a caller can hand this a
+    // ref `parse_type` would never build.  The answer is a `false`
+    // rather than a read past the end of the marker list.
+    test.assert(not gqllang.is_non_null(GqlTypeRef { name: "String", list_depth: 2,
+                                                     non_null: [false] }))

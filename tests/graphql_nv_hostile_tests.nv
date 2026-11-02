@@ -1,0 +1,76 @@
+use std.list
+use std.str
+use std.test
+use std.time
+use gqlexec
+use gqlcheck
+use gqlerr
+use gqllang
+use gqlsdl
+
+// Documents whose cost is in the shape of the fragment graph rather than
+// in their length.  Validation visits a fragment once however many
+// spreads lead to it, so a document of a few hundred bytes must not take
+// longer than a few milliseconds.
+
+fn schema() -> gqlsdl.GqlSchema
+    match gqlsdl.build("type Query {\n  a: Int\n  count(n: Int): Int\n}\n")
+        Ok(s)  => s
+        Err(_) => GqlSchema { types: [], directives: [], query_type: "Query",
+                              mutation_type: "", subscription_type: "", description: "" }
+
+// A query spreading `F{levels}`, where every fragment `F{i}` spreads
+// `F{i-1}` twice, so the number of paths to the bottom is 2^levels.
+// The bottom fragment uses an undeclared variable.
+fn doubling_document(levels: Int) -> Str
+    doubling_with(levels, "count(n: \$x)")
+
+// The same document with `leaf` as the bottom fragment's only field.
+fn doubling_with(levels: Int, leaf: Str) -> Str
+    var doc = "query { ...F" + str.from_int(levels) + " }\n"
+    var i = levels
+    while i > 0
+        let below = "F" + str.from_int(i - 1)
+        doc = doc + "fragment F" + str.from_int(i) + " on Query { ..." + below + " ..." + below + " }\n"
+        i = i - 1
+    doc + "fragment F0 on Query { " + leaf + " }\n"
+
+@test
+fn test_a_document_with_exponentially_many_spread_paths_validates_in_bounded_time() [io, time]
+    let src = doubling_document(30)
+    let parsed = gqllang.parse_executable(src, gqllang.default_limits())
+    match parsed
+        Err(_) => test.fail("the document did not parse")
+        Ok(d)  =>
+            let started = time.now()
+            let errors = gqlcheck.validate(schema(), d)
+            let took = time.now() - started
+            test.assert(took < 2.0)
+            // The undeclared variable is reported once, not once per path.
+            test.assert(list.len(errors) >= 1)
+
+struct Answers
+    unused: Int
+
+impl GqlResolver[] for Answers
+    fn gql_resolve(self, ctx: gqlexec.GqlFieldCtx) -> gqlexec.GqlOutcome []
+        GqlValue("1")
+
+    fn gql_type_of(self, abstract_type: Str, value_json: Str) -> Str []
+        ""
+
+    fn gql_serialize_scalar(self, scalar: Str, value_json: Str) -> gqlexec.GqlOutcome []
+        GqlValue(value_json)
+
+@test
+fn test_executing_a_document_with_exponentially_many_spread_paths_is_bounded() [io, time]
+    let started = time.now()
+    let r = match gqlexec.execute(schema(), Answers { unused: 0 },
+                                  gqlexec.request(doubling_with(30, "a")), "{}",
+                                  gqllang.default_limits())
+        Ok(x)  => x
+        Err(_) => gqlexec.error_response([gqlerr.error("refused")])
+    let took = time.now() - started
+    test.assert(took < 2.0)
+    // One field `a`, however many spreads lead to it.
+    test.assert_eq_str(r.data, "{\"a\":1}")

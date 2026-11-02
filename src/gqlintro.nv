@@ -1,8 +1,6 @@
 // gqlintro.nv — `__schema`, `__type` and `__typename`, answered from a
 // schema value.  `[]`.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // INTROSPECTION IS NOT A RESOLVER'S JOB, WHICH IS WHY IT IS A MODULE.
 // § 4's three meta-fields are answered entirely from the schema, and a
 // deployment that had to write resolvers for `__Type`, `__Field`,
@@ -29,7 +27,11 @@
 // introspection off and leaving the suggestions on is the combination
 // that buys nothing at all.
 
+use std.json
+use std.list
+use std.str
 use gqlerr
+use gqllang
 use gqlsdl
 
 // What a deployment allows to be discovered.
@@ -50,6 +52,652 @@ pub struct GqlIntroPolicy
     // deployment-wide default behind it.
     include_deprecated: Bool
 
+// ── Private helpers ──────────────────────────────────────────────────
+
+// A JSON string.
+fn jstr(s: Str) -> json.JsonValueH
+    json.string(s)
+
+// A JSON string, or null where the text is empty — which is how every
+// optional description, reason and URL travels.
+fn jopt(s: Str) -> json.JsonValueH
+    if str.len(s) == 0
+        json.null()
+    else
+        json.string(s)
+
+// A root type as § 4.5 spells it: `__Type`, an object with a `name`,
+// and NOT the name on its own — `queryType` is `{"name": "Query"}` and
+// `mutationType` is the same shape or null.
+//
+// A bare string here reads back as no root at all, so a schema with a
+// mutation root came out of `document`/`schema_of` with none:
+// `str_member(string, "name")` is "".  The reader has always expected
+// this shape (`root_name`), and the introspection query asks for it.
+fn jroot(name: Str) -> json.JsonValueH
+    if str.len(name) == 0
+        json.null()
+    else
+        jobj([("name", jstr(name))])
+
+fn jbool(b: Bool) -> json.JsonValueH
+    json.bool(b)
+
+fn jlist(xs: [json.JsonValueH]) -> json.JsonValueH
+    json.array(xs)
+
+fn jobj(kvs: [(Str, json.JsonValueH)]) -> json.JsonValueH
+    json.object(kvs)
+
+// The policy a SNAPSHOT is taken with.
+//
+// Everything, deprecations included: a snapshot that hid them would
+// lose every field and enum value a deployment has deprecated, and
+// `gqlexec` then filters them by § 4.5's `includeDeprecated` argument
+// as each selection asks — which is what makes the argument mean
+// something rather than being decided once at the top.
+fn snapshot_policy() -> GqlIntroPolicy
+    GqlIntroPolicy { enabled: true, suggestions_off: false, include_deprecated: true }
+
+// § 3.13's location names in the order the specification lists them:
+// the seven executable ones first, then the twelve type-system ones.
+fn directive_location_names() -> [Str]
+    ["QUERY", "MUTATION", "SUBSCRIPTION", "FIELD", "FRAGMENT_DEFINITION",
+     "FRAGMENT_SPREAD", "INLINE_FRAGMENT", "VARIABLE_DEFINITION", "SCHEMA",
+     "SCALAR", "OBJECT", "FIELD_DEFINITION", "ARGUMENT_DEFINITION", "INTERFACE",
+     "UNION", "ENUM", "ENUM_VALUE", "INPUT_OBJECT", "INPUT_FIELD_DEFINITION"]
+
+// ── Editing a name ───────────────────────────────────────────────────
+
+// Levenshtein distance, byte by byte, which is what a "did you mean"
+// is measured with.
+fn edit_distance(a: Str, b: Str) -> Int
+    let low_a = str.lower(a)
+    let low_b = str.lower(b)
+    let n = str.len(low_a)
+    let m = str.len(low_b)
+    var prev: [Int] = []
+    var k = 0
+    while k <= m
+        prev = list.push(prev, k)
+        k = k + 1
+    var i = 1
+    while i <= n
+        var cur: [Int] = [i]
+        var j = 1
+        while j <= m
+            let ca = str.byte_at(low_a, i - 1) ?? 0
+            let cb = str.byte_at(low_b, j - 1) ?? 0
+            var cost = 1
+            if ca == cb
+                cost = 0
+            var best = list.get(prev, j, 0) + 1
+            let insert = list.get(cur, j - 1, 0) + 1
+            if insert < best
+                best = insert
+            let substitute = list.get(prev, j - 1, 0) + cost
+            if substitute < best
+                best = substitute
+            cur = list.push(cur, best)
+            j = j + 1
+        prev = list.clone(cur)
+        i = i + 1
+    list.get(prev, m, 0)
+
+// The closest of these names to one somebody typed, or empty where
+// nothing is close.
+//
+// The ceiling grows with what was typed: `mee` against `me` is one
+// edit and is offered, while a two-letter name against a two-letter
+// mistake is a guess rather than a suggestion, which is why a short
+// name needs an exact-ish match and a long one may be several edits
+// out.
+fn closest_name(names: [Str], attempted: Str) -> Str
+    var best = ""
+    var best_distance = 1000
+    for n in names
+        let d = edit_distance(n, attempted)
+        if d > 0 and d < best_distance
+            best = n
+            best_distance = d
+    let ceiling = 1 + str.len(attempted) / 3
+    if best_distance > ceiling
+        return ""
+    best
+
+// ── Emitting the document ────────────────────────────────────────────
+
+// The kind word for a named type the schema or the meta-types define.
+fn named_kind(s: gqlsdl.GqlSchema, name: Str) -> Str
+    match gqlsdl.type_named(s, name)
+        Some(t) => type_kind_name(t.kind)
+        // cov: skip — unreachable from here: every name `named_ref` is handed comes out of a schema `gqlsdl.build`/`build_from` accepted, which validates that a union's members and a type's interfaces are defined, and `type_named` answers the eight meta-types and the built-in scalars besides.  The arm is the match's own completeness, not a shape a document can reach.
+        None    => "SCALAR"
+
+// A type as a REFERENCE: `{"kind":…,"name":…,"ofType":null}`.
+//
+// The shape a field's type travels as, and the reason a schema with a
+// type that refers to itself produces a finite document: a reference
+// carries no members, so the document's depth is the query's and not
+// the schema's.
+fn named_ref(s: gqlsdl.GqlSchema, name: Str) -> json.JsonValueH
+    jobj([("kind", jstr(named_kind(s, name))),
+          ("name", jstr(name)),
+          ("ofType", json.null())])
+
+fn wrapper_ref(kind: Str, of: json.JsonValueH) -> json.JsonValueH
+    jobj([("kind", jstr(kind)), ("name", json.null()), ("ofType", of)])
+
+// The wrapper chain § 4.5 models as nested `__Type` objects: `[User!]!`
+// is a `NON_NULL` whose `ofType` is a `LIST` whose `ofType` is a
+// `NON_NULL` whose `ofType` is `User`.
+fn ref_of(s: gqlsdl.GqlSchema, t: gqllang.GqlTypeRef) -> json.JsonValueH
+    var node = named_ref(s, t.name)
+    if list.get(t.non_null, 0, false)
+        node = wrapper_ref("NON_NULL", node)
+    var i = 1
+    while i <= t.list_depth
+        node = wrapper_ref("LIST", node)
+        if list.get(t.non_null, i, false)
+            node = wrapper_ref("NON_NULL", node)
+        i = i + 1
+    node
+
+fn name_refs(s: gqlsdl.GqlSchema, names: [Str]) -> json.JsonValueH
+    var xs: [json.JsonValueH] = list.map(names, n => named_ref(s, n))
+    jlist(xs)
+
+// One input value: a field's argument, or an input object's field.
+fn input_value_of(s: gqlsdl.GqlSchema, a: gqlsdl.GqlArgDef) -> json.JsonValueH
+    jobj([("name", jstr(a.name)),
+          ("description", jopt(a.description)),
+          ("type", ref_of(s, a.type_ref)),
+          ("defaultValue", default_text_of(a)),
+          ("isDeprecated", jbool(str.len(a.deprecated) > 0)),
+          ("deprecationReason", jopt(a.deprecated))])
+
+// A default value as the SDL text § 4.5 requires: `"1"`, `"[A, B]"`,
+// `"\"now\""`.
+fn default_text_of(a: gqlsdl.GqlArgDef) -> json.JsonValueH
+    match a.default_value
+        Some(v) => jstr(gqllang.print_value(v))
+        None    => json.null()
+
+fn input_values_of(s: gqlsdl.GqlSchema, p: GqlIntroPolicy,
+                   args: [gqlsdl.GqlArgDef]) -> json.JsonValueH
+    var xs: [json.JsonValueH] = []
+    for a in args
+        if p.include_deprecated or str.len(a.deprecated) == 0
+            xs = list.push(xs, input_value_of(s, a))
+    jlist(xs)
+
+fn field_of(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, f: gqlsdl.GqlFieldDef) -> json.JsonValueH
+    jobj([("name", jstr(f.name)),
+          ("description", jopt(f.description)),
+          ("args", input_values_of(s, p, f.args)),
+          ("type", ref_of(s, f.type_ref)),
+          ("isDeprecated", jbool(str.len(f.deprecated) > 0)),
+          ("deprecationReason", jopt(f.deprecated))])
+
+fn enum_value_of(v: gqlsdl.GqlEnumValueDef) -> json.JsonValueH
+    jobj([("name", jstr(v.name)),
+          ("description", jopt(v.description)),
+          ("isDeprecated", jbool(str.len(v.deprecated) > 0)),
+          ("deprecationReason", jopt(v.deprecated))])
+
+// `null` for a member a kind does not have, which is what § 4.5 says
+// rather than an empty list: `"fields": []` for a scalar claims the
+// scalar has no fields, where `"fields": null` says it has none to
+// speak of.
+fn fields_of(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    let w = type_kind_name(t.kind)
+    if w != "OBJECT" and w != "INTERFACE"
+        return json.null()
+    var xs: [json.JsonValueH] = []
+    for f in t.fields
+        if p.include_deprecated or str.len(f.deprecated) == 0
+            xs = list.push(xs, field_of(s, p, f))
+    jlist(xs)
+
+fn enum_values_of(p: GqlIntroPolicy, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    if type_kind_name(t.kind) != "ENUM"
+        return json.null()
+    var xs: [json.JsonValueH] = []
+    for v in t.enum_values
+        if p.include_deprecated or str.len(v.deprecated) == 0
+            xs = list.push(xs, enum_value_of(v))
+    jlist(xs)
+
+fn input_fields_of(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    if type_kind_name(t.kind) != "INPUT_OBJECT"
+        return json.null()
+    input_values_of(s, p, t.input_fields)
+
+fn interfaces_of(s: gqlsdl.GqlSchema, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    let w = type_kind_name(t.kind)
+    if w != "OBJECT" and w != "INTERFACE"
+        return json.null()
+    name_refs(s, t.interfaces)
+
+fn possible_types_of(s: gqlsdl.GqlSchema, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    let w = type_kind_name(t.kind)
+    if w != "INTERFACE" and w != "UNION"
+        return json.null()
+    name_refs(s, gqlsdl.possible_types(s, t.name))
+
+// One type, in the FULL shape a `types` entry travels as: every member
+// and no `ofType`, because that is what the introspection query asks
+// for at that level.
+fn type_of(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, t: gqlsdl.GqlTypeDef) -> json.JsonValueH
+    jobj([("kind", jstr(type_kind_name(t.kind))),
+          ("name", jstr(t.name)),
+          ("description", jopt(t.description)),
+          ("specifiedByURL", jopt(t.specified_by)),
+          ("fields", fields_of(s, p, t)),
+          ("interfaces", interfaces_of(s, t)),
+          ("possibleTypes", possible_types_of(s, t)),
+          ("enumValues", enum_values_of(p, t)),
+          ("inputFields", input_fields_of(s, p, t))])
+
+// Every type a client may ask about: the deployment's own, and § 4.5's
+// eight, which `gqlsdl.type_named` answers as part of the type system.
+fn all_types(s: gqlsdl.GqlSchema) -> [gqlsdl.GqlTypeDef]
+    var out: [gqlsdl.GqlTypeDef] = list.clone(s.types)
+    for name in meta_type_names()
+        out = list.concat(out, meta_def(s, name))
+    out
+
+// One meta-type as a one-element list, so a walk over the eight reads
+// the same whether or not the look-up answers.
+fn meta_def(s: gqlsdl.GqlSchema, name: Str) -> [gqlsdl.GqlTypeDef]
+    match gqlsdl.type_named(s, name)
+        Some(t) => [t]
+        // cov: skip — unreachable from here: the only caller walks `meta_type_names()`, and `gqlsdl.type_named` answers all eight of them from the meta-type table it owns, so the look-up answers every time.  The arm keeps the walk uniform if that table ever gains a name it has no definition for.
+        None    => []
+
+fn directive_of(d: gqlsdl.GqlDirectiveDef, p: GqlIntroPolicy) -> json.JsonValueH
+    jobj([("name", jstr(d.name)),
+          ("description", jopt(d.description)),
+          ("isRepeatable", jbool(d.repeatable)),
+          ("locations", jlist(name_strings(d.locations))),
+          ("args", input_values_of_empty(d.args, p))])
+
+// A list of names as a list of JSON strings.
+fn name_strings(names: [Str]) -> [json.JsonValueH]
+    var xs: [json.JsonValueH] = list.map(names, n => jstr(n))
+    xs
+
+fn input_values_of_empty(args: [gqlsdl.GqlArgDef], p: GqlIntroPolicy) -> json.JsonValueH
+    var xs: [json.JsonValueH] = []
+    for a in args
+        if p.include_deprecated or str.len(a.deprecated) == 0
+            xs = list.push(xs, input_value_of_empty(a))
+    jlist(xs)
+
+fn input_value_of_empty(a: gqlsdl.GqlArgDef) -> json.JsonValueH
+    jobj([("name", jstr(a.name)),
+          ("description", jopt(a.description)),
+          ("type", wrapper_chain_of(a.type_ref)),
+          ("defaultValue", default_text_of(a)),
+          ("isDeprecated", jbool(str.len(a.deprecated) > 0)),
+          ("deprecationReason", jopt(a.deprecated))])
+
+// A reference without a schema to look a kind up in: a directive's
+// argument types are the built-in scalars and the meta-types, so the
+// named kind is read from the name.
+fn wrapper_chain_of(t: gqllang.GqlTypeRef) -> json.JsonValueH
+    var node = jobj([("kind", jstr("SCALAR")), ("name", jstr(t.name)), ("ofType", json.null())])
+    if list.get(t.non_null, 0, false)
+        node = wrapper_ref("NON_NULL", node)
+    var i = 1
+    while i <= t.list_depth
+        node = wrapper_ref("LIST", node)
+        if list.get(t.non_null, i, false)
+            node = wrapper_ref("NON_NULL", node)
+        i = i + 1
+    node
+
+fn schema_of_json(s: gqlsdl.GqlSchema, p: GqlIntroPolicy) -> json.JsonValueH
+    var types: [json.JsonValueH] = list.map(all_types(s), t => type_of(s, p, t))
+    var dirs: [json.JsonValueH] = list.map(s.directives, d => directive_of(d, p))
+    jobj([("description", jopt(s.description)),
+          ("queryType", jroot(s.query_type)),
+          ("mutationType", jroot(s.mutation_type)),
+          ("subscriptionType", jroot(s.subscription_type)),
+          ("types", jlist(types)),
+          ("directives", jlist(dirs))])
+
+// ── Reading the document back ────────────────────────────────────────
+
+// A reader that refuses nothing until it has read everything, so a
+// document that is wrong in three ways is three sentences and not the
+// first one.
+struct Reader
+    var problems: [Str]
+
+// A member that may be a list; an absent or non-list member is no
+// members, which each reader treats as its own kind of empty.
+fn members_of(v: json.JsonValueH, key: Str) -> [json.JsonValueH]
+    match json.get_list(v, key)
+        Some(xs) => list.clone(xs)
+        None     => []
+
+fn str_member(v: json.JsonValueH, key: Str) -> Str
+    json.get_str(v, key) ?? ""
+
+fn bool_member(v: json.JsonValueH, key: Str) -> Bool
+    json.get_bool(v, key) ?? false
+
+// One JSON string as a one-element list, so a walk that skips what it
+// cannot read reads uniformly.
+fn one_string(v: json.JsonValueH) -> [Str]
+    match json.to_str(v)
+        Some(s) => [s]
+        None    => []
+
+fn strings_of(v: json.JsonValueH, key: Str) -> [Str]
+    var out: [Str] = []
+    for x in members_of(v, key)
+        out = list.concat(out, one_string(x))
+    out
+
+// The `name` member of each entry, for the members § 4.5 spells as a
+// list of `__Type` REFERENCES rather than a list of names: a union's
+// `possibleTypes` and a type's `interfaces` travel as objects, and
+// reading them as strings finds nothing at all.
+fn type_names_of(v: json.JsonValueH, key: Str) -> [Str]
+    var out: [Str] = []
+    for x in members_of(v, key)
+        let n = str_member(x, "name")
+        if str.len(n) > 0
+            out = list.push(out, n)
+    out
+
+// The `@deprecated` reason a member carries, empty where it is not
+// deprecated.  § 4.5 gives `@deprecated` a default reason, so
+// `isDeprecated: true` with no reason is a reason and not a blank.
+fn deprecation_of(v: json.JsonValueH) -> Str
+    if not bool_member(v, "isDeprecated")
+        return ""
+    match json.get_str(v, "deprecationReason")
+        Some(reason) => reason
+        None         => "No longer supported"
+
+// The type kinds a `types` entry may name, in § 4.5's own words.  Note
+// that `LIST` and `NON_NULL` are NOT among them: at this level a type
+// is named and not a wrapper.
+fn kind_words() -> [Str]
+    ["SCALAR", "OBJECT", "INTERFACE", "UNION", "ENUM", "INPUT_OBJECT"]
+
+fn kind_from_word(w: Str) -> gqlsdl.GqlTypeKind
+    match w
+        "OBJECT"       => GqlObject
+        "INTERFACE"    => GqlInterface
+        "UNION"        => GqlUnion
+        "ENUM"         => GqlEnum
+        "INPUT_OBJECT" => GqlInputObject
+        _              => GqlScalar
+
+// A `__Type` chain read back as a type: `NON_NULL(LIST(NON_NULL(User)))`
+// is `[User!]!`.
+fn ref_from_json(v: json.JsonValueH) -> ?gqllang.GqlTypeRef
+    ref_chain(v, [])
+
+fn ref_chain(v: json.JsonValueH, wraps: [Str]) -> ?gqllang.GqlTypeRef
+    let kind = str_member(v, "kind")
+    if kind == "LIST" or kind == "NON_NULL"
+        match json.get(v, "ofType")
+            None        => None
+            Some(inner) => ref_chain(inner, list.push(list.clone(wraps), kind))
+    else
+        let name = str_member(v, "name")
+        if str.len(name) == 0
+            return None
+        Some(ref_of_chain(name, wraps))
+
+fn ref_of_chain(name: Str, wraps: [Str]) -> gqllang.GqlTypeRef
+    let inward = list.reverse(list.clone(wraps))
+    var depth = 0
+    for w in wraps
+        if w == "LIST"
+            depth = depth + 1
+    var markers: [Bool] = []
+    var i = 0
+    if list.get(inward, 0, "") == "NON_NULL"
+        markers = list.push(markers, true)
+        i = 1
+    else
+        markers = list.push(markers, false)
+    for at in i..list.len(inward)
+        if list.get(inward, at, "") == "LIST"
+            markers = list.push(markers, list.get(inward, at + 1, "") == "NON_NULL")
+    // cov: skip — unreachable for the chains `ref_chain` builds: the leading wrapper always pushes one marker and the loop above pushes one per `LIST`, so the list is `depth + 1` long by the time it ends.  Kept as the invariant the reader of `GqlTypeRef` relies on — a marker list shorter than `depth + 1` would make `markers[depth]` read past the end.
+    while list.len(markers) < depth + 1
+        markers = list.push(markers, false)
+    GqlTypeRef { name: name, list_depth: depth, non_null: markers }
+
+fn read_input_value(var r: Reader, v: json.JsonValueH) -> gqlsdl.GqlArgDef
+    var default: ?gqllang.GqlValueNode = None
+    match json.get_str(v, "defaultValue")
+        Some(text) =>
+            default = gqllang.parse_value(text)
+        None       =>
+            default = None
+    GqlArgDef { name: str_member(v, "name"), description: str_member(v, "description"),
+                       type_ref: type_ref_or_named(v), default_value: default,
+                       deprecated: deprecation_of(v), directives: [] }
+
+// A `__Type` reference read as a type, with a named type of `String`
+// where the reference is unreadable — the field then refers to a type
+// the schema does not have, which `gqlsdl.build_from` names rather than
+// this reader guessing.
+//
+// It reads the ENCLOSING object — a field, an argument, an input value
+// — because § 4.5 puts the reference under `type` and not in place of
+// it.
+fn type_ref_or_named(v: json.JsonValueH) -> gqllang.GqlTypeRef
+    match json.get(v, "type")
+        None    => gqllang.named_type("String")
+        Some(t) =>
+            match ref_from_json(t)
+                Some(r) => r
+                None    => gqllang.named_type("String")
+
+fn read_enum_value(v: json.JsonValueH) -> gqlsdl.GqlEnumValueDef
+    GqlEnumValueDef { name: str_member(v, "name"), description: str_member(v, "description"),
+                             deprecated: deprecation_of(v), directives: [] }
+
+fn read_field(var r: Reader, v: json.JsonValueH) -> gqlsdl.GqlFieldDef
+    var args: [gqlsdl.GqlArgDef] = list.map(members_of(v, "args"), a => read_input_value(var r, a))
+    GqlFieldDef { name: str_member(v, "name"), description: str_member(v, "description"),
+                         args: args, type_ref: type_ref_or_named(v),
+                         deprecated: deprecation_of(v), directives: [] }
+
+fn read_type(var r: Reader, v: json.JsonValueH) -> ?gqlsdl.GqlTypeDef
+    let name = str_member(v, "name")
+    // cov: skip — unreachable: the only caller, `read_types`, drops a nameless entry in its own filter before calling this, so the body below re-checks a precondition that is already established.  Kept as this function's own contract rather than deleted.
+    if str.len(name) == 0
+        r.problems = list.push(r.problems, "a `types` entry has no `name`")
+        return None
+    let word = str_member(v, "kind")
+    if not list.contains(kind_words(), word)
+        r.problems = list.push(r.problems, "the type `" + name + "` has kind `" + word
+            + "`, which is not one of " + str.join(kind_words(), ", "))
+        return None
+    var fields: [gqlsdl.GqlFieldDef] = list.map(members_of(v, "fields"), f => read_field(var r, f))
+    var ins: [gqlsdl.GqlArgDef] = list.map(members_of(v, "inputFields"), a => read_input_value(var r, a))
+    var evs: [gqlsdl.GqlEnumValueDef] = list.map(members_of(v, "enumValues"), e => read_enum_value(e))
+    Some(GqlTypeDef { kind: kind_from_word(word), name: name,
+                             description: str_member(v, "description"), fields: fields,
+                             input_fields: ins, enum_values: evs,
+                             interfaces: type_names_of(v, "interfaces"),
+                             members: type_names_of(v, "possibleTypes"),
+                             specified_by: str_member(v, "specifiedByURL"),
+                             directives: [], loc: GqlLoc { line: 0, column: 0 } })
+
+// The types a document defines, with § 4.5's meta-types and the
+// built-in scalars left out: a schema is rebuilt with those, and a
+// document carrying them back in would be a schema that defines
+// `String` twice.
+fn read_types(var r: Reader, sc: json.JsonValueH) -> [gqlsdl.GqlTypeDef]
+    var out: [gqlsdl.GqlTypeDef] = []
+    match json.get_list(sc, "types")
+        None     =>
+            r.problems = list.push(r.problems, "the `__schema` member has no `types` array")
+        Some(xs) =>
+            for x in xs
+                let name = str_member(x, "name")
+                if str.len(name) > 0 and not str.starts_with(name, "__") and not list.contains(gqlsdl.builtin_scalars(), name)
+                    out = list.concat(out, one_type(var r, x))
+    out
+
+fn one_type(var r: Reader, v: json.JsonValueH) -> [gqlsdl.GqlTypeDef]
+    match read_type(var r, v)
+        Some(t) => [t]
+        None    => []
+
+fn read_directives(var r: Reader, sc: json.JsonValueH) -> [gqlsdl.GqlDirectiveDef]
+    var out: [gqlsdl.GqlDirectiveDef] = []
+    for x in members_of(sc, "directives")
+        let name = str_member(x, "name")
+        if str.len(name) > 0 and not list.contains(gqlsdl.builtin_directives(), name)
+            var args: [gqlsdl.GqlArgDef] = list.map(members_of(x, "args"), a => read_input_value(var r, a))
+            out = list.push(out, GqlDirectiveDef { name: name,
+                                                          description: str_member(x, "description"),
+                                                          args: args,
+                                                          locations: strings_of(x, "locations"),
+                                                          repeatable: bool_member(x, "isRepeatable") })
+    out
+
+// The `__schema` member of an introspection result, in any of the three
+// shapes a caller has in hand: the whole response, the response's
+// `data`, or the schema object itself.
+fn schema_member(v: json.JsonValueH) -> ?json.JsonValueH
+    match find_member(v, "__schema")
+        Some(sc) => Some(sc)
+        None     =>
+            match find_member(v, "data")
+                Some(d) =>
+                    match find_member(d, "__schema")
+                        Some(sc) => Some(sc)
+                        None     => bare_schema(v)
+                None    => bare_schema(v)
+
+fn find_member(v: json.JsonValueH, key: Str) -> ?json.JsonValueH
+    json.get(v, key)
+
+fn bare_schema(v: json.JsonValueH) -> ?json.JsonValueH
+    if json.get(v, "types") == None or json.get(v, "queryType") == None
+        return None
+    Some(v)
+
+fn root_name(sc: json.JsonValueH, key: Str) -> Str
+    match find_member(sc, key)
+        None    => ""
+        Some(t) => str_member(t, "name")
+
+fn read_schema(sc: json.JsonValueH) -> Result<gqlsdl.GqlSchema, gqlerr.GqlFault>
+    var r = Reader { problems: [] }
+    let types = read_types(var r, sc)
+    let dirs = read_directives(var r, sc)
+    let q = root_name(sc, "queryType")
+    if str.len(q) == 0
+        r.problems = list.push(r.problems, "there is no `queryType`, and § 3.3 says a schema needs one")
+    if list.len(r.problems) > 0
+        return Err(GqlSchemaInvalid(str.join(r.problems, "\n")))
+    gqlsdl.build_from(types, dirs, q, root_name(sc, "mutationType"), root_name(sc, "subscriptionType"))
+
+// ── The lines of the introspection query ─────────────────────────────
+
+fn query_lines() -> [Str]
+    var out: [Str] = ["query IntrospectionQuery {",
+     "  __schema {",
+     "    queryType { name }",
+     "    mutationType { name }",
+     "    subscriptionType { name }",
+     "    types {",
+     "      ...FullType",
+     "    }",
+     "    directives {",
+     "      name",
+     "      description",
+     "      isRepeatable",
+     "      locations",
+     "      args(includeDeprecated: true) {",
+     "        ...InputValue",
+     "      }",
+     "    }",
+     "  }",
+     "}",
+     "",
+     "fragment FullType on __Type {",
+     "  kind",
+     "  name",
+     "  description",
+     "  specifiedByURL",
+     "  fields(includeDeprecated: true) {",
+     "    name",
+     "    description",
+     "    args(includeDeprecated: true) {",
+     "      ...InputValue",
+     "    }",
+     "    type {",
+     "      ...TypeRef",
+     "    }",
+     "    isDeprecated",
+     "    deprecationReason",
+     "  }",
+     "  inputFields(includeDeprecated: true) {",
+     "    ...InputValue",
+     "  }",
+     "  interfaces {",
+     "    ...TypeRef",
+     "  }",
+     "  enumValues(includeDeprecated: true) {",
+     "    name",
+     "    description",
+     "    isDeprecated",
+     "    deprecationReason",
+     "  }",
+     "  possibleTypes {",
+     "    ...TypeRef",
+     "  }",
+     "}",
+     "",
+     "fragment InputValue on __InputValue {",
+     "  name",
+     "  description",
+     "  type { ...TypeRef }",
+     "  defaultValue",
+     "  isDeprecated",
+     "  deprecationReason",
+     "}",
+     "",
+     "fragment TypeRef on __Type {"]
+    out = list.concat(out, type_ref_lines(7))
+    list.concat(out, ["}"])
+
+// The nested `ofType` a TypeRef fragment unwinds: seven levels, which is
+// what graphql-js sends and is one more than any type in practice
+// needs.
+fn type_ref_lines(depth: Int) -> [Str]
+    var out: [Str] = []
+    var i = 0
+    while i < depth
+        out = list.push(out, str.repeat("  ", i + 1) + "ofType {")
+        out = list.push(out, str.repeat("  ", i + 1) + "  kind")
+        out = list.push(out, str.repeat("  ", i + 1) + "  name")
+        i = i + 1
+    out = list.push(out, str.repeat("  ", depth + 1) + "kind")
+    out = list.push(out, str.repeat("  ", depth + 1) + "name")
+    var j = depth
+    while j > 0
+        out = list.push(out, str.repeat("  ", j) + "}")
+        j = j - 1
+    out
+
+// ── The policy ───────────────────────────────────────────────────────
+
 // Introspection on, suggestions on, deprecations hidden — which is
 // § 4's own default behaviour.
 //
@@ -60,7 +708,7 @@ pub struct GqlIntroPolicy
 //     println("${gqlintro.defaults().enabled}")
 // ```
 pub fn defaults() -> GqlIntroPolicy []
-    todo("graphql-nv.gqlintro.defaults")
+    GqlIntroPolicy { enabled: true, suggestions_off: false, include_deprecated: false }
 
 // Introspection off AND suggestions off.
 //
@@ -77,7 +725,7 @@ pub fn defaults() -> GqlIntroPolicy []
 //     println("${p.enabled} ${p.suggestions_off}")
 // ```
 pub fn closed() -> GqlIntroPolicy []
-    todo("graphql-nv.gqlintro.closed")
+    GqlIntroPolicy { enabled: false, suggestions_off: true, include_deprecated: false }
 
 // ── Answering the meta-fields ────────────────────────────────────────
 
@@ -94,7 +742,7 @@ pub fn closed() -> GqlIntroPolicy []
 //     println("${gqlintro.is_meta_field("__typename")}")
 // ```
 pub fn is_meta_field(name: Str) -> Bool []
-    todo("graphql-nv.gqlintro.is_meta_field")
+    name == "__typename" or name == "__schema" or name == "__type"
 
 // Whether a meta-field is one the policy answers.
 //
@@ -111,7 +759,11 @@ pub fn is_meta_field(name: Str) -> Bool []
 //     println("${gqlintro.answers(gqlintro.closed(), "__typename")}")
 // ```
 pub fn answers(p: GqlIntroPolicy, field: Str) -> Bool []
-    todo("graphql-nv.gqlintro.answers")
+    if field == "__typename"
+        return true
+    if not p.enabled
+        return false
+    field == "__schema" or field == "__type"
 
 // The `__schema` field's value, as JSON.
 //
@@ -128,7 +780,7 @@ pub fn answers(p: GqlIntroPolicy, field: Str) -> Bool []
 //         Ok(s)  => println(gqlintro.schema_value(s, gqlintro.defaults()))
 // ```
 pub fn schema_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy) -> Str []
-    todo("graphql-nv.gqlintro.schema_value")
+    json.stringify(schema_of_json(s, p))
 
 // The `__type(name:)` field's value, as JSON, or `None` for a type the
 // schema does not have.
@@ -146,7 +798,9 @@ pub fn schema_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy) -> Str []
 //                 None    => println("no such type")
 // ```
 pub fn type_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, name: Str) -> ?Str []
-    todo("graphql-nv.gqlintro.type_value")
+    match gqlsdl.type_named(s, name)
+        None    => None
+        Some(t) => Some(json.stringify(type_of(s, p, t)))
 
 // ── The whole document ───────────────────────────────────────────────
 
@@ -156,6 +810,11 @@ pub fn type_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, name: Str) -> ?Str []
 // `[]`, and that is what makes a whole class of tooling not need a
 // server: a schema registry, a code generator or a linter produces
 // this from an SDL file with nothing running.
+//
+// A SNAPSHOT AND NOT A DEFAULT VIEW: it is taken with deprecations
+// included, because a registry that lost every deprecated member would
+// lose exactly the set a deployment is still serving.  `schema_value`
+// with a policy is the filtering view.
 //
 // ```novo
 // use gqlintro
@@ -167,7 +826,10 @@ pub fn type_value(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, name: Str) -> ?Str []
 //         Ok(s)  => println(gqlintro.document(s))
 // ```
 pub fn document(s: gqlsdl.GqlSchema) -> Str []
-    todo("graphql-nv.gqlintro.document")
+    json.stringify(snapshot_of(s))
+
+fn snapshot_of(s: gqlsdl.GqlSchema) -> json.JsonValueH
+    jobj([("data", jobj([("__schema", schema_of_json(s, snapshot_policy()))]))])
 
 // A schema rebuilt FROM an introspection document.
 //
@@ -190,7 +852,12 @@ pub fn document(s: gqlsdl.GqlSchema) -> Str []
 //         Err(_) => println("not an introspection document")
 // ```
 pub fn schema_of(document_json: Str) -> Result<gqlsdl.GqlSchema, gqlerr.GqlFault> []
-    todo("graphql-nv.gqlintro.schema_of")
+    match json.parse(document_json)
+        None    => Err(GqlSchemaInvalid("an introspection document is JSON, and this is not"))
+        Some(v) =>
+            match schema_member(v)
+                None     => Err(GqlSchemaInvalid("there is no `__schema` member: a full introspection query answers `{\"data\":{\"__schema\": …}}`"))
+                Some(sc) => read_schema(sc)
 
 // The introspection query itself, as a document.
 //
@@ -207,7 +874,7 @@ pub fn schema_of(document_json: Str) -> Result<gqlsdl.GqlSchema, gqlerr.GqlFault
 //     println("${str.len(gqlintro.introspection_query())}")
 // ```
 pub fn introspection_query() -> Str []
-    todo("graphql-nv.gqlintro.introspection_query")
+    str.join(query_lines(), "\n")
 
 // ── The meta-types ───────────────────────────────────────────────────
 
@@ -227,7 +894,8 @@ pub fn introspection_query() -> Str []
 //     println("${list.len(gqlintro.meta_type_names())}")
 // ```
 pub fn meta_type_names() -> [Str] []
-    todo("graphql-nv.gqlintro.meta_type_names")
+    ["__Schema", "__Type", "__Field", "__InputValue", "__EnumValue", "__Directive",
+     "__TypeKind", "__DirectiveLocation"]
 
 // The `__TypeKind` spelling of a type's kind: `SCALAR`, `OBJECT`,
 // `INTERFACE`, `UNION`, `ENUM`, `INPUT_OBJECT`, `LIST`, `NON_NULL`.
@@ -246,7 +914,13 @@ pub fn meta_type_names() -> [Str] []
 //     println(gqlintro.type_kind_name(gqlsdl.GqlObject))
 // ```
 pub fn type_kind_name(k: gqlsdl.GqlTypeKind) -> Str []
-    todo("graphql-nv.gqlintro.type_kind_name")
+    match k
+        GqlScalar      => "SCALAR"
+        GqlObject      => "OBJECT"
+        GqlInterface   => "INTERFACE"
+        GqlUnion       => "UNION"
+        GqlEnum        => "ENUM"
+        GqlInputObject => "INPUT_OBJECT"
 
 // The `__DirectiveLocation` values § 3.13 defines: the seven
 // executable locations and the twelve type-system ones.
@@ -259,7 +933,7 @@ pub fn type_kind_name(k: gqlsdl.GqlTypeKind) -> Str []
 //     println("${list.len(gqlintro.directive_locations())}")
 // ```
 pub fn directive_locations() -> [Str] []
-    todo("graphql-nv.gqlintro.directive_locations")
+    directive_location_names()
 
 // A suggestion for an unknown field name, or empty where the policy
 // says no.
@@ -280,4 +954,16 @@ pub fn directive_locations() -> [Str] []
 // ```
 pub fn suggest_field(s: gqlsdl.GqlSchema, p: GqlIntroPolicy, type_name: Str,
                      attempted: Str) -> Str []
-    todo("graphql-nv.gqlintro.suggest_field")
+    if p.suggestions_off
+        return ""
+    match gqlsdl.type_named(s, type_name)
+        None    => ""
+        Some(t) =>
+            let guess = closest_name(field_names(t), attempted)
+            if str.len(guess) == 0
+                return ""
+            "did you mean `" + guess + "`?"
+
+fn field_names(t: gqlsdl.GqlTypeDef) -> [Str]
+    var out: [Str] = list.map(t.fields, f => f.name)
+    out
