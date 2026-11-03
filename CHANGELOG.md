@@ -5,11 +5,13 @@ All notable changes to graphql-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
 - Internal: ladders rewritten as match. The escape reader, the lexer's string scanner, the executor's dispatch and the SDL reader read as one match on the byte or the word, a failed step is propagated with `!`, and the private hex-digit readers answer an optional. No public signature or behaviour changed.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-12
 
@@ -223,6 +225,16 @@ for one — and each carries the marker and its reason in place.
   `allow_header()` to the 405 it answered.
 
 
+
+The dependency ranges move to the dependencies' current releases.  A
+pre-1.0 caret range admits only the release it names, so the old
+ranges held this package on interface releases, and a program could
+not take this package beside those packages' current releases.  No
+signature in this package changed.
+
+- form-nv: `^0.0.1` to `^0.1.0`.
+
+## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the dependencies' current releases.  A
 pre-1.0 caret range admits only the release it names, so the old
